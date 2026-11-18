@@ -60,9 +60,9 @@ func TestProcurementUsesCompleteVerticalLayout(t *testing.T) {
 		"service.go": {"NewService"},
 		"create.go":  {"CreateForOrder", "createProcurementForSingleOrder", "hasUpstreamItems"},
 		"submit.go": {
-			"SubmitToUpstream", "markProcurementError", "rejectProcurement",
+			"SubmitToUpstream", "markProcurementError", "rejectProcurement", "newEvidenceEventID", "freezeFakaForEvidenceFailure",
 			"rollbackLocalOrderOnProcurementFailure", "notifyProcurementFailure", "handleSubmitFailure",
-			"isRetryableErrorCode", "parseRetryIntervals", "recordUpstreamOrderAfterStatusChanged",
+			"isRetryableErrorCode", "parseRetryIntervals", "recordUpstreamOrderAfterStatusChanged", "reportFakaTradeCASRecovery",
 		},
 		"callback.go": {"HandleUpstreamCallback", "createUpstreamFulfillment", "isUpstreamTransitionAllowed"},
 		"poll.go":     {"PollUpstreamStatus", "requeuePoll", "SyncAcceptedOrders", "syncAcceptedOrder", "requeueStalledSubmissions", "mapProcurementUpstreamStatus"},
@@ -73,7 +73,7 @@ func TestProcurementUsesCompleteVerticalLayout(t *testing.T) {
 			"fillUpstreamRefundRecordsForProcurementOrder", "isPositiveUpstreamRefundAmount",
 			"fillUpstreamRefundRecordsForProcurementOrders",
 		},
-		"manual.go": {"RetryManual", "CancelManual"},
+		"manual.go": {"ListTradeResponseJournal", "RecordTradeResponseReconciliation", "RetryManual", "CancelManual", "NewTradeResponseJournalRecovery", "ImportByEventID", "ScanPending", "ListTradeEvidenceConflicts", "ResolveTradeEvidenceConflict"},
 	}
 	for file, want := range expected {
 		parsed := parseProductionGoFile(t, filepath.Join(applicationRoot, file))

@@ -5,29 +5,33 @@ import (
 
 	productdomain "github.com/dujiao-next/internal/modules/catalog/product/domain"
 	siteconnectiondomain "github.com/dujiao-next/internal/modules/siteconnection/domain"
+	"github.com/dujiao-next/internal/shared/jsonmap"
 	"github.com/dujiao-next/internal/shared/money"
 )
 
 // 上游商品状态枚举（Mapping.UpstreamStatus）
 const (
-	UpstreamStatusActive   = "active"   // 正常在售
-	UpstreamStatusInactive = "inactive" // 上游已下架，但商品仍存在
-	UpstreamStatusDeleted  = "deleted"  // 上游已删除（软删），不再存在
+	UpstreamStatusActive        = "active"         // 正常在售
+	UpstreamStatusInactive      = "inactive"       // 上游已下架，但商品仍存在
+	UpstreamStatusDeleted       = "deleted"        // 上游已删除（软删），不再存在
+	UpstreamStatusIdentityError = "identity_error" // 上游数字 ID 与原始 code 未通过校验
 )
 
 // Mapping 表示一个本地商品与上游商品之间的映射。
 type Mapping struct {
-	ID                      uint       `gorm:"primarykey" json:"id"`
-	ConnectionID            uint       `gorm:"index;not null" json:"connection_id"`
-	LocalProductID          uint       `gorm:"uniqueIndex;not null" json:"local_product_id"`
-	UpstreamProductID       uint       `gorm:"not null" json:"upstream_product_id"`
-	UpstreamFulfillmentType string     `gorm:"type:varchar(20);not null;default:'manual'" json:"upstream_fulfillment_type"` // 上游原始交付类型（auto/manual）
-	UpstreamStatus          string     `gorm:"type:varchar(16);not null;default:'active';index" json:"upstream_status"`     // 上游商品状态：active/inactive/deleted
-	IsActive                bool       `gorm:"not null;default:true" json:"is_active"`
-	LastSyncedAt            *time.Time `json:"last_synced_at,omitempty"`
-	CreatedAt               time.Time  `gorm:"index" json:"created_at"`
-	UpdatedAt               time.Time  `gorm:"index" json:"updated_at"`
-	DeletedAt               *time.Time `gorm:"index" json:"-"`
+	ID                      uint         `gorm:"primarykey" json:"id"`
+	ConnectionID            uint         `gorm:"index;not null" json:"connection_id"`
+	LocalProductID          uint         `gorm:"uniqueIndex;not null" json:"local_product_id"`
+	UpstreamProductID       uint         `gorm:"not null" json:"upstream_product_id"`
+	UpstreamProductCode     string       `gorm:"type:text" json:"upstream_product_code,omitempty"`
+	FakaProcurementProfile  jsonmap.JSON `gorm:"type:json" json:"faka_procurement_profile,omitempty"`
+	UpstreamFulfillmentType string       `gorm:"type:varchar(20);not null;default:'manual'" json:"upstream_fulfillment_type"` // 上游原始交付类型（auto/manual）
+	UpstreamStatus          string       `gorm:"type:varchar(16);not null;default:'active';index" json:"upstream_status"`     // 上游商品状态：active/inactive/deleted
+	IsActive                bool         `gorm:"not null;default:true" json:"is_active"`
+	LastSyncedAt            *time.Time   `json:"last_synced_at,omitempty"`
+	CreatedAt               time.Time    `gorm:"index" json:"created_at"`
+	UpdatedAt               time.Time    `gorm:"index" json:"updated_at"`
+	DeletedAt               *time.Time   `gorm:"index" json:"-"`
 
 	Connection *siteconnectiondomain.Connection `gorm:"foreignKey:ConnectionID" json:"connection,omitempty"`
 	Product    *productdomain.Product           `gorm:"foreignKey:LocalProductID" json:"product,omitempty"`

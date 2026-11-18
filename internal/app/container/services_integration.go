@@ -2,6 +2,7 @@ package container
 
 import (
 	catalogmappingbootstrap "github.com/dujiao-next/internal/bootstrap/catalogmapping"
+	procurementaudit "github.com/dujiao-next/internal/bootstrap/procurementaudit"
 	telegrambroadcast "github.com/dujiao-next/internal/bootstrap/telegrambroadcast"
 	"github.com/dujiao-next/internal/logger"
 	apicredentialapp "github.com/dujiao-next/internal/modules/apicredential/application"
@@ -23,6 +24,7 @@ import (
 	paymentapp "github.com/dujiao-next/internal/modules/payment/application"
 	paymentqueue "github.com/dujiao-next/internal/modules/payment/infrastructure/queueadapter"
 	procurementapp "github.com/dujiao-next/internal/modules/procurement/application"
+	procurementevidence "github.com/dujiao-next/internal/modules/procurement/infrastructure/evidencestore/local"
 	procurementmapping "github.com/dujiao-next/internal/modules/procurement/infrastructure/mappingreader"
 	procurementnotification "github.com/dujiao-next/internal/modules/procurement/infrastructure/notificationadapter"
 	procurementorder "github.com/dujiao-next/internal/modules/procurement/infrastructure/orderreader"
@@ -42,6 +44,13 @@ import (
 
 // initIntegrationServices 装配通知、站点对接、支付、采购、渠道与 Telegram 集成。
 func (c *Container) initIntegrationServices() {
+	if c.Config.EvidenceStore.LocalDir != "" {
+		store, err := procurementevidence.New(c.Config.EvidenceStore.LocalDir)
+		if err != nil {
+			panic(err)
+		}
+		c.ProcurementEvidenceStore = store
+	}
 	c.UserLoginLogService = auditlogapp.NewUserLoginService(c.UserLoginLogRepo)
 	c.AuthzAuditService = auditlogapp.NewAuthzService(c.AuthzAuditLogRepo)
 	c.AdminLoginLogService = auditlogapp.NewAdminLoginService(c.AdminLoginLogRepo)
@@ -124,6 +133,8 @@ func (c *Container) initIntegrationServices() {
 		DownstreamCallback: c.DownstreamCallbackService,
 		BotNotifier:        c.FulfillmentService,
 		Notifications:      procurementnotification.New(c.NotificationService),
+		DecisionAudit:      procurementaudit.New(gormdb.DB),
+		EvidenceStore:      c.ProcurementEvidenceStore,
 	})
 	c.ReconciliationService = reconciliationapp.NewService(reconciliationapp.Options{
 		Jobs: c.ReconciliationJobRepo, Items: c.ReconciliationItemRepo,

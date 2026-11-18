@@ -22,12 +22,29 @@ var _ procurementcontract.SKUMappingReader = (*SKUReader)(nil)
 func NewProducts(source ProductSource) *ProductReader { return &ProductReader{source: source} }
 func NewSKUs(source SKUReaderSource) *SKUReader       { return &SKUReader{source: source} }
 
-func (r *ProductReader) FindConnectionID(productID uint) (uint, bool, error) {
+func (r *ProductReader) FindMappingForProduct(productID uint) (*procurementcontract.ProcurementMapping, error) {
 	mapping, err := r.source.GetByLocalProductID(productID)
 	if err != nil || mapping == nil {
-		return 0, false, err
+		return nil, err
 	}
-	return mapping.ConnectionID, true, nil
+	return &procurementcontract.ProcurementMapping{
+		ID: mapping.ID, ConnectionID: mapping.ConnectionID,
+		UpstreamProductID:   mapping.UpstreamProductID,
+		UpstreamProductCode: mapping.UpstreamProductCode,
+		IsActive:            mapping.IsActive, UpstreamStatus: mapping.UpstreamStatus,
+	}, nil
+}
+
+func (r *SKUReader) FindMappingForSKU(skuID uint) (*procurementcontract.ProcurementSKUMapping, error) {
+	mapping, err := r.source.GetByLocalSKUID(skuID)
+	if err != nil || mapping == nil {
+		return nil, err
+	}
+	return &procurementcontract.ProcurementSKUMapping{
+		ProductMappingID: mapping.ProductMappingID,
+		UpstreamSKUID:    mapping.UpstreamSKUID,
+		IsActive:         mapping.UpstreamIsActive,
+	}, nil
 }
 
 func (r *SKUReader) FindUpstreamSKUID(skuID uint) (uint, bool, error) {

@@ -14,25 +14,26 @@ import (
 
 // Config 应用配置结构
 type Config struct {
-	App          AppConfig          `mapstructure:"app"`
-	Server       ServerConfig       `mapstructure:"server"`
-	Log          LogConfig          `mapstructure:"log"`
-	Database     DatabaseConfig     `mapstructure:"database"`
-	JWT          JWTConfig          `mapstructure:"jwt"`
-	UserJWT      JWTConfig          `mapstructure:"user_jwt"`
-	Bootstrap    BootstrapConfig    `mapstructure:"bootstrap"`
-	TelegramAuth TelegramAuthConfig `mapstructure:"telegram_auth"`
-	GoogleAuth   GoogleAuthConfig   `mapstructure:"google_auth"`
-	Redis        RedisConfig        `mapstructure:"redis"`
-	Queue        QueueConfig        `mapstructure:"queue"`
-	Upload       UploadConfig       `mapstructure:"upload"`
-	CORS         CORSConfig         `mapstructure:"cors"`
-	Security     SecurityConfig     `mapstructure:"security"`
-	Email        EmailConfig        `mapstructure:"email"`
-	Order        OrderConfig        `mapstructure:"order"`
-	Captcha      CaptchaConfig      `mapstructure:"captcha"`
-	Web          WebConfig          `mapstructure:"web"`
-	Reseller     ResellerConfig     `mapstructure:"reseller"`
+	App           AppConfig           `mapstructure:"app"`
+	Server        ServerConfig        `mapstructure:"server"`
+	Log           LogConfig           `mapstructure:"log"`
+	Database      DatabaseConfig      `mapstructure:"database"`
+	JWT           JWTConfig           `mapstructure:"jwt"`
+	UserJWT       JWTConfig           `mapstructure:"user_jwt"`
+	Bootstrap     BootstrapConfig     `mapstructure:"bootstrap"`
+	TelegramAuth  TelegramAuthConfig  `mapstructure:"telegram_auth"`
+	GoogleAuth    GoogleAuthConfig    `mapstructure:"google_auth"`
+	Redis         RedisConfig         `mapstructure:"redis"`
+	Queue         QueueConfig         `mapstructure:"queue"`
+	Upload        UploadConfig        `mapstructure:"upload"`
+	EvidenceStore EvidenceStoreConfig `mapstructure:"evidence_store"`
+	CORS          CORSConfig          `mapstructure:"cors"`
+	Security      SecurityConfig      `mapstructure:"security"`
+	Email         EmailConfig         `mapstructure:"email"`
+	Order         OrderConfig         `mapstructure:"order"`
+	Captcha       CaptchaConfig       `mapstructure:"captcha"`
+	Web           WebConfig           `mapstructure:"web"`
+	Reseller      ResellerConfig      `mapstructure:"reseller"`
 }
 
 // AppConfig 应用级配置
@@ -210,6 +211,11 @@ type UploadConfig struct {
 	AllowedExtensions []string `mapstructure:"allowed_extensions"`
 	MaxWidth          int      `mapstructure:"max_width"`
 	MaxHeight         int      `mapstructure:"max_height"`
+}
+
+// EvidenceStoreConfig configures the per-instance durable local spool.
+type EvidenceStoreConfig struct {
+	LocalDir string `mapstructure:"local_dir"`
 }
 
 // CORSConfig 跨域配置

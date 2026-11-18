@@ -56,6 +56,7 @@ type ProductListResult struct {
 // UpstreamProduct 上游商品信息
 type UpstreamProduct struct {
 	ID               uint                              `json:"id"`
+	Code             string                            `json:"code,omitempty"`
 	Slug             string                            `json:"slug"`
 	SeoMeta          jsonmap.JSON                      `json:"seo_meta"`
 	Title            jsonmap.JSON                      `json:"title"`
@@ -70,10 +71,17 @@ type UpstreamProduct struct {
 	Currency         string                            `json:"currency"`
 	FulfillmentType  string                            `json:"fulfillment_type"`
 	ManualFormSchema jsonmap.JSON                      `json:"manual_form_schema"`
+	FakaProcurement  *FakaProductProcurementProfile    `json:"faka_procurement,omitempty"`
 	IsActive         bool                              `json:"is_active"`
 	CategoryID       uint                              `json:"category_id"`
 	SKUs             []UpstreamSKU                     `json:"skus"`
 	UpdatedAt        time.Time                         `json:"updated_at"`
+}
+
+// ProductCodeAdapter is implemented by upstream protocols whose stable product
+// identity is a string code rather than the shared numeric product ID.
+type ProductCodeAdapter interface {
+	GetProductByCode(ctx context.Context, code string) (*UpstreamProduct, error)
 }
 
 // UpstreamCategory 上游分类信息
@@ -108,6 +116,7 @@ type UpstreamSKU struct {
 // CreateUpstreamOrderReq 创建上游采购单请求
 type CreateUpstreamOrderReq struct {
 	SKUID             uint         `json:"sku_id"`
+	SharedCode        string       `json:"shared_code,omitempty"`
 	Quantity          int          `json:"quantity"`
 	ManualFormData    jsonmap.JSON `json:"manual_form_data,omitempty"`
 	DownstreamOrderNo string       `json:"downstream_order_no"`
@@ -181,6 +190,8 @@ func NewAdapter(conn *siteconnectiondomain.Connection, uploadsDir string) (Adapt
 	switch conn.Protocol {
 	case constants.ConnectionProtocolDujiaoNext:
 		return NewDujiaoNextAdapter(conn, uploadsDir), nil
+	case constants.ConnectionProtocolFaka:
+		return NewFakaAdapter(conn), nil
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", conn.Protocol)
 	}

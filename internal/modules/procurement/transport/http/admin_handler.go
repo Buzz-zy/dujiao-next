@@ -18,8 +18,34 @@ type Service interface {
 	StatsByStatus(procurementcontract.ListFilter) (map[string]int64, error)
 	GetByID(id uint) (*procurementdomain.Order, error)
 	FillParentOrderNo(order *procurementdomain.Order)
-	RetryManual(id uint) error
+	RetryManual(id uint, resolution ...procurementcontract.ManualResolution) error
+	ListTradeResponseJournal(traceID string) ([]procurementdomain.TradeResponseJournalEntry, error)
+	RecordTradeResponseReconciliation(orderID uint, traceID, confirmedTradeNo, confirmedAmount, note string, operatorAdminID uint) error
+	ListTradeEvidenceConflicts(eventID string) ([]procurementdomain.TradeEvidenceConflict, error)
+	ResolveTradeEvidenceConflict(id, adminID uint, note string) error
 	CancelManual(id uint) error
+}
+
+type ResolveTradeEvidenceConflictRequest struct {
+	Note string `json:"note" binding:"required,min=3,max=1000"`
+}
+
+type TradeResponseReconciliationRequest struct {
+	TraceID string `json:"trace_id" binding:"required"`
+	TradeNo string `json:"trade_no"`
+	Amount  string `json:"amount"`
+	Note    string `json:"note" binding:"required,min=5,max=1000"`
+}
+
+type UnknownResolutionRequest struct {
+	TradeNo string `json:"trade_no"`
+	Reason  string `json:"reason" binding:"required,min=5,max=1000"`
+}
+
+type UnknownRetryAuthorizationRequest struct {
+	Reason            string `json:"reason" binding:"required,min=5,max=1000"`
+	ConfirmedNoCharge bool   `json:"confirmed_no_charge" binding:"required"`
+	ConfirmedNoOrder  bool   `json:"confirmed_no_order" binding:"required"`
 }
 
 type AdminHandler struct {
@@ -194,7 +220,155 @@ func (h *AdminHandler) RetryProcurementOrder(c *gin.Context) {
 	response.Success(c, gin.H{"ok": true})
 }
 
+func (h *AdminHandler) ResolveUnknownProcurementOrder(c *gin.Context) {
+	id, err := ginutil.ParseParamUint(c, "id")
+	if err != nil {
+		ginutil.RespondError(c, response.CodeBadRequest, "error.bad_request", err)
+		return
+	}
+	adminID, ok := ginutil.GetAdminID(c)
+	if !ok {
+		ginutil.RespondError(c, response.CodeUnauthorized, "error.admin_id_invalid", nil)
+		return
+	}
+	var req UnknownResolutionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ginutil.RespondBindError(c, err)
+		return
+	}
+	if strings.TrimSpace(req.TradeNo) == "" {
+		ginutil.RespondErrorWithMsg(c, response.CodeBadRequest, "trade_no is required when confirming an upstream order", nil)
+		return
+	}
+	if err := h.service.RetryManual(id, procurementcontract.ManualResolution{Mode: "order_found", OperatorAdminID: adminID, TradeNo: req.TradeNo, Reason: req.Reason}); err != nil {
+		if errors.Is(err, procurementcontract.ErrNotFound) {
+			ginutil.RespondError(c, response.CodeNotFound, "error.procurement_not_found", nil)
+			return
+		}
+		if errors.Is(err, procurementcontract.ErrStatusInvalid) {
+			ginutil.RespondErrorWithMsg(c, response.CodeBadRequest, err.Error(), nil)
+			return
+		}
+		ginutil.RespondError(c, response.CodeInternal, "error.procurement_fetch_failed", err)
+		return
+	}
+	response.Success(c, gin.H{"ok": true})
+}
+
+func (h *AdminHandler) AuthorizeUnknownProcurementRetry(c *gin.Context) {
+	id, err := ginutil.ParseParamUint(c, "id")
+	if err != nil {
+		ginutil.RespondError(c, response.CodeBadRequest, "error.bad_request", err)
+		return
+	}
+	adminID, ok := ginutil.GetAdminID(c)
+	if !ok {
+		ginutil.RespondError(c, response.CodeUnauthorized, "error.admin_id_invalid", nil)
+		return
+	}
+	var req UnknownRetryAuthorizationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ginutil.RespondBindError(c, err)
+		return
+	}
+	if err := h.service.RetryManual(id, procurementcontract.ManualResolution{Mode: "no_charge", OperatorAdminID: adminID, Reason: req.Reason, ConfirmedNoCharge: req.ConfirmedNoCharge, ConfirmedNoOrder: req.ConfirmedNoOrder}); err != nil {
+		if errors.Is(err, procurementcontract.ErrNotFound) {
+			ginutil.RespondError(c, response.CodeNotFound, "error.procurement_not_found", nil)
+			return
+		}
+		if errors.Is(err, procurementcontract.ErrStatusInvalid) {
+			ginutil.RespondErrorWithMsg(c, response.CodeBadRequest, err.Error(), nil)
+			return
+		}
+		ginutil.RespondError(c, response.CodeInternal, "error.procurement_retry_failed", err)
+		return
+	}
+	response.Success(c, gin.H{"ok": true})
+}
+
 // CancelProcurementOrder 手动取消采购单
+func (h *AdminHandler) ListTradeResponseJournal(c *gin.Context) {
+	traceID := strings.TrimSpace(c.Query("trace_id"))
+	if traceID == "" {
+		ginutil.RespondError(c, response.CodeBadRequest, "error.bad_request", nil)
+		return
+	}
+	entries, err := h.service.ListTradeResponseJournal(traceID)
+	if err != nil {
+		ginutil.RespondError(c, response.CodeInternal, "error.procurement_fetch_failed", err)
+		return
+	}
+	response.Success(c, gin.H{"items": entries})
+}
+
+func (h *AdminHandler) RecordTradeResponseReconciliation(c *gin.Context) {
+	id, err := ginutil.ParseParamUint(c, "id")
+	if err != nil {
+		ginutil.RespondError(c, response.CodeBadRequest, "error.bad_request", err)
+		return
+	}
+	adminID, ok := ginutil.GetAdminID(c)
+	if !ok {
+		ginutil.RespondError(c, response.CodeUnauthorized, "error.admin_id_invalid", nil)
+		return
+	}
+	var req TradeResponseReconciliationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ginutil.RespondBindError(c, err)
+		return
+	}
+	if err := h.service.RecordTradeResponseReconciliation(id, strings.TrimSpace(req.TraceID), strings.TrimSpace(req.TradeNo), strings.TrimSpace(req.Amount), strings.TrimSpace(req.Note), adminID); err != nil {
+		if errors.Is(err, procurementcontract.ErrNotFound) {
+			ginutil.RespondError(c, response.CodeNotFound, "error.procurement_not_found", nil)
+			return
+		}
+		if errors.Is(err, procurementcontract.ErrStatusInvalid) {
+			ginutil.RespondErrorWithMsg(c, response.CodeBadRequest, err.Error(), nil)
+			return
+		}
+		ginutil.RespondError(c, response.CodeInternal, "error.procurement_retry_failed", err)
+		return
+	}
+	response.Success(c, gin.H{"ok": true})
+}
+
+func (h *AdminHandler) ListTradeEvidenceConflicts(c *gin.Context) {
+	eventID := strings.TrimSpace(c.Query("event_id"))
+	if eventID == "" {
+		ginutil.RespondError(c, response.CodeBadRequest, "error.bad_request", nil)
+		return
+	}
+	rows, err := h.service.ListTradeEvidenceConflicts(eventID)
+	if err != nil {
+		ginutil.RespondError(c, response.CodeInternal, "error.procurement_fetch_failed", err)
+		return
+	}
+	response.Success(c, gin.H{"items": rows})
+}
+
+func (h *AdminHandler) ResolveTradeEvidenceConflict(c *gin.Context) {
+	id, err := ginutil.ParseParamUint(c, "id")
+	if err != nil {
+		ginutil.RespondError(c, response.CodeBadRequest, "error.bad_request", err)
+		return
+	}
+	adminID, ok := ginutil.GetAdminID(c)
+	if !ok {
+		ginutil.RespondError(c, response.CodeUnauthorized, "error.admin_id_invalid", nil)
+		return
+	}
+	var req ResolveTradeEvidenceConflictRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		ginutil.RespondBindError(c, err)
+		return
+	}
+	if err := h.service.ResolveTradeEvidenceConflict(id, adminID, strings.TrimSpace(req.Note)); err != nil {
+		ginutil.RespondError(c, response.CodeInternal, "error.procurement_retry_failed", err)
+		return
+	}
+	response.Success(c, gin.H{"ok": true})
+}
+
 func (h *AdminHandler) CancelProcurementOrder(c *gin.Context) {
 	if h.service == nil {
 		ginutil.RespondErrorWithMsg(c, response.CodeInternal, "service not available", nil)

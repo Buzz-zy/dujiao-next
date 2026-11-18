@@ -64,19 +64,36 @@ func (s *Service) createProcurementForSingleOrder(order *procurementdomain.Local
 	if len(order.Items) == 0 {
 		return fmt.Errorf("order %d has no items", order.ID)
 	}
+	if len(order.Items) != 1 {
+		return fmt.Errorf("order %d has %d items; procurement supports one item per child order", order.ID, len(order.Items))
+	}
 	item := order.Items[0]
 
 	// 查找商品映射
-	connectionID, found, err := s.mappingRepo.FindConnectionID(item.ProductID)
+	mapping, err := s.mappingRepo.FindMappingForProduct(item.ProductID)
 	if err != nil {
-		return fmt.Errorf("lookup product mapping: %w", err)
+		return fmt.Errorf("read product mapping: %w", err)
 	}
-	if !found {
-		return fmt.Errorf("no product mapping for product %d", item.ProductID)
+	skuMapping, err := s.skuMapRepo.FindMappingForSKU(item.SKUID)
+	if err != nil {
+		return fmt.Errorf("read SKU mapping: %w", err)
+	}
+	if err := procurementcontract.ValidateProcurementMapping(mapping, skuMapping, item.ProductID, item.SKUID, 0, false); err != nil {
+		return err
+	}
+	connection, err := s.connections.Open(mapping.ConnectionID)
+	if err != nil {
+		return fmt.Errorf("open mapped connection %d: %w", mapping.ConnectionID, err)
+	}
+	if connection == nil {
+		return procurementcontract.ErrConnectionNotFound
+	}
+	if err := procurementcontract.ValidateProcurementMapping(mapping, skuMapping, item.ProductID, item.SKUID, mapping.ConnectionID, connection.Protocol() == constants.ConnectionProtocolFaka); err != nil {
+		return err
 	}
 
 	procOrder := &procurementdomain.Order{
-		ConnectionID:    connectionID,
+		ConnectionID:    mapping.ConnectionID,
 		LocalOrderID:    order.ID,
 		LocalOrderNo:    order.OrderNo,
 		Status:          "pending",
@@ -92,7 +109,7 @@ func (s *Service) createProcurementForSingleOrder(order *procurementdomain.Local
 	logger.Infow("procurement_order_created",
 		"procurement_order_id", procOrder.ID,
 		"local_order_id", order.ID,
-		"connection_id", connectionID,
+		"connection_id", mapping.ConnectionID,
 	)
 
 	// 入队提交任务

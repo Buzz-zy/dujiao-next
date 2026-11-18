@@ -28,12 +28,13 @@ type Fulfillment struct {
 }
 
 type CreateOrderRequest struct {
-	SKUID             uint
-	Quantity          int
-	ManualFormData    jsonmap.JSON
-	DownstreamOrderNo string
-	TraceID           string
-	CallbackURL       string
+	SKUID               uint
+	UpstreamProductCode string
+	Quantity            int
+	ManualFormData      jsonmap.JSON
+	DownstreamOrderNo   string
+	TraceID             string
+	CallbackURL         string
 }
 
 type CreateOrderResult struct {
@@ -58,13 +59,34 @@ type UpstreamOrder struct {
 	RefundRecords  []jsonmap.JSON
 }
 
+type ManualResolution struct {
+	Mode              string
+	OperatorAdminID   uint
+	TradeNo           string
+	Reason            string
+	ConfirmedNoCharge bool
+	ConfirmedNoOrder  bool
+}
+
 type UpstreamConnection interface {
+	Protocol() string
 	CallbackURL() string
 	RetryMax() int
 	RetryIntervals() string
 	CreateOrder(ctx context.Context, request CreateOrderRequest) (*CreateOrderResult, error)
 	GetOrder(ctx context.Context, orderID uint) (*UpstreamOrder, error)
 	CancelOrder(ctx context.Context, orderID uint) error
+}
+
+// FakaProcurementCapabilityVerifier performs a live product-detail check before
+// any Faka purchase request. It is optional and only required by Faka sessions.
+type FakaProcurementCapabilityVerifier interface {
+	VerifyFakaProcurementCapability(ctx context.Context, code string, expectedProductID uint, quantity int) error
+}
+
+// FakaOrderQuerier queries by Faka's original string trade number.
+type FakaOrderQuerier interface {
+	QueryFakaTrade(ctx context.Context, tradeNo string) (*UpstreamOrder, error)
 }
 
 // UseCase 是支付、HTTP、上游回调与 Worker 共享的正式采购应用契约。
@@ -79,6 +101,8 @@ type UseCase interface {
 	List(filter ListFilter) ([]procurementdomain.Order, int64, error)
 	StatsByStatus(filter ListFilter) (map[string]int64, error)
 	FillParentOrderNo(order *procurementdomain.Order)
-	RetryManual(id uint) error
+	RetryManual(id uint, resolution ...ManualResolution) error
+	ListTradeResponseJournal(traceID string) ([]procurementdomain.TradeResponseJournalEntry, error)
+	RecordTradeResponseReconciliation(orderID uint, traceID, confirmedTradeNo, confirmedAmount, note string, operatorAdminID uint) error
 	CancelManual(id uint) error
 }

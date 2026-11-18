@@ -1,11 +1,16 @@
 package application
 
 import (
+	"context"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/dujiao-next/internal/constants"
 	mappingcontract "github.com/dujiao-next/internal/modules/catalog/mapping/contract"
 	mappingdomain "github.com/dujiao-next/internal/modules/catalog/mapping/domain"
+	siteconnectioncontract "github.com/dujiao-next/internal/modules/siteconnection/contract"
+	"github.com/dujiao-next/internal/upstream"
 )
 
 // 文件组织约定:
@@ -86,7 +91,53 @@ func (s *Service) SetActive(id uint, active bool) error {
 	if mapping == nil {
 		return mappingcontract.ErrMappingNotFound
 	}
+	if active && mapping.UpstreamStatus == mappingdomain.UpstreamStatusIdentityError {
+		return mappingcontract.ErrIdentityVerificationRequired
+	}
 	mapping.IsActive = active
+	return s.mappings.Update(mapping)
+}
+
+func (s *Service) VerifyFakaIdentity(mappingID uint) error {
+	mapping, err := s.mappings.GetByID(mappingID)
+	if err != nil {
+		return err
+	}
+	if mapping == nil {
+		return mappingcontract.ErrMappingNotFound
+	}
+	if mapping.UpstreamStatus != mappingdomain.UpstreamStatusIdentityError {
+		return mappingcontract.ErrIdentityVerificationRequired
+	}
+	if strings.TrimSpace(mapping.UpstreamProductCode) == "" {
+		return upstream.ErrFakaProductCodeMissing
+	}
+	conn, err := s.connections.GetByID(mapping.ConnectionID)
+	if err != nil {
+		return err
+	}
+	if conn == nil {
+		return siteconnectioncontract.ErrNotFound
+	}
+	adapter, err := s.connections.GetAdapter(conn)
+	if err != nil {
+		return err
+	}
+	codeAdapter, ok := adapter.(upstream.ProductCodeAdapter)
+	if !ok {
+		return mappingcontract.ErrIdentityVerificationRequired
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	product, err := codeAdapter.GetProductByCode(ctx, mapping.UpstreamProductCode)
+	if err != nil {
+		return err
+	}
+	if err := validateFakaProductMapping(mapping, product); err != nil {
+		return err
+	}
+	mapping.UpstreamStatus = mappingdomain.UpstreamStatusActive
+	mapping.IsActive = true
 	return s.mappings.Update(mapping)
 }
 

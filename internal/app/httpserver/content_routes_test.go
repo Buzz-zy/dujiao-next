@@ -22,6 +22,10 @@ import (
 	adminstore "github.com/dujiao-next/internal/modules/identity/admin/infrastructure/gormstore"
 	adminauthapp "github.com/dujiao-next/internal/modules/identity/adminauth/application"
 	"github.com/dujiao-next/internal/modules/identity/jwttoken"
+
+	procurementcontract "github.com/dujiao-next/internal/modules/procurement/contract"
+	procurementdomain "github.com/dujiao-next/internal/modules/procurement/domain"
+	procurementhttp "github.com/dujiao-next/internal/modules/procurement/transport/http"
 	"github.com/dujiao-next/internal/platform/http/response"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -273,3 +277,245 @@ func newContentRouteAccessRouter(adminRepo admincontract.Store, authzService *au
 	contenttransport.RegisterAdminRoutes(admin, contenttransport.NewAdminHandler(nil, nil, nil, nil))
 	return router
 }
+
+const procurementConflictJWTSecret = "procurement-conflict-route-test-secret"
+
+func TestProcurementTradeEvidenceConflictRoutesEnforceAdminAccessAndIdentity(t *testing.T) {
+	adminRepo, authzService, noPermissionToken, integrationToken, integrationAdminID := setupProcurementConflictRouteAccessTest(t)
+	service := &procurementConflictHTTPService{
+		conflicts: []procurementdomain.TradeEvidenceConflict{{
+			ID: 17, ConflictKey: "conflict-key", EventID: "event-17", ProcurementOrderID: 9,
+			TraceID: "trace-9", ConflictType: "event_content_mismatch", ExistingEventHash: "old-hash",
+			IncomingEventHash: "new-hash", Status: "pending",
+		}},
+		journal: []procurementdomain.TradeResponseJournalEntry{{
+			ID: 1, ProcurementOrderID: 9, TraceID: "trace-9", UpstreamTradeNo: "TRADE-9", Amount: "12.00", EventType: "trade_response",
+		}},
+	}
+	router := newProcurementConflictAccessRouter(adminRepo, authzService, service)
+
+	queryPath := "/api/v1/admin/procurement-trade-evidence-conflicts?event_id=event-17"
+	resolvePath := "/api/v1/admin/procurement-trade-evidence-conflicts/17/resolve"
+	denied := []struct {
+		name   string
+		method string
+		path   string
+		token  string
+		body   string
+		status int
+	}{
+		{name: "anonymous query", method: http.MethodGet, path: queryPath, status: response.CodeUnauthorized},
+		{name: "anonymous resolve", method: http.MethodPost, path: resolvePath, body: `{"note":"reviewed by operator"}`, status: response.CodeUnauthorized},
+		{name: "ordinary user query", method: http.MethodGet, path: queryPath, token: signProcurementConflictUserToken(t), status: response.CodeUnauthorized},
+		{name: "ordinary user resolve with forged admin id", method: http.MethodPost, path: resolvePath, token: signProcurementConflictUserToken(t), body: `{"admin_id":999,"note":"reviewed by operator"}`, status: response.CodeUnauthorized},
+		{name: "admin without permission query", method: http.MethodGet, path: queryPath, token: noPermissionToken, status: response.CodeForbidden},
+		{name: "admin without permission resolve", method: http.MethodPost, path: resolvePath, token: noPermissionToken, body: `{"note":"reviewed by operator"}`, status: response.CodeForbidden},
+	}
+	for _, tc := range denied {
+		t.Run(tc.name, func(t *testing.T) {
+			before := service.conflicts[0]
+			request := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			if tc.body != "" {
+				request.Header.Set("Content-Type", "application/json")
+			}
+			if tc.token != "" {
+				request.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			assertProcurementConflictBusinessStatus(t, recorder, tc.status)
+			if service.queryCalls != 0 || service.resolveCalls != 0 {
+				t.Fatalf("unauthorized request reached service: queries=%d resolves=%d", service.queryCalls, service.resolveCalls)
+			}
+			if service.conflicts[0] != before {
+				t.Fatalf("unauthorized request changed conflict: before=%#v after=%#v", before, service.conflicts[0])
+			}
+		})
+	}
+
+	queryRequest := httptest.NewRequest(http.MethodGet, queryPath, nil)
+	queryRequest.Header.Set("Authorization", "Bearer "+integrationToken)
+	queryRecorder := httptest.NewRecorder()
+	router.ServeHTTP(queryRecorder, queryRequest)
+	assertProcurementConflictBusinessStatus(t, queryRecorder, response.CodeOK)
+	if service.queryCalls != 1 || service.lastEventID != "event-17" {
+		t.Fatalf("authorized query not dispatched correctly: calls=%d eventID=%q", service.queryCalls, service.lastEventID)
+	}
+
+	journalBefore, err := json.Marshal(service.journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolveRequest := httptest.NewRequest(http.MethodPost, resolvePath, strings.NewReader(`{"admin_id":999,"note":"confirmed against source evidence"}`))
+	resolveRequest.Header.Set("Content-Type", "application/json")
+	resolveRequest.Header.Set("Authorization", "Bearer "+integrationToken)
+	resolveRecorder := httptest.NewRecorder()
+	router.ServeHTTP(resolveRecorder, resolveRequest)
+	assertProcurementConflictBusinessStatus(t, resolveRecorder, response.CodeOK)
+	if service.resolveCalls != 1 || service.lastResolvedAdminID != integrationAdminID {
+		t.Fatalf("resolution identity must come from authenticated context: calls=%d adminID=%d want=%d", service.resolveCalls, service.lastResolvedAdminID, integrationAdminID)
+	}
+	if got := service.conflicts[0]; got.Status != "resolved" || got.ResolvedByAdminID == nil || *got.ResolvedByAdminID != integrationAdminID || got.ResolutionNote != "confirmed against source evidence" {
+		t.Fatalf("authorized resolution not recorded as expected: %#v", got)
+	}
+	journalAfter, err := json.Marshal(service.journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(journalAfter) != string(journalBefore) {
+		t.Fatalf("conflict resolution changed original Journal: before=%s after=%s", journalBefore, journalAfter)
+	}
+
+	procurementRequest := httptest.NewRequest(http.MethodGet, "/api/v1/admin/procurement-orders", nil)
+	procurementRequest.Header.Set("Authorization", "Bearer "+integrationToken)
+	procurementRecorder := httptest.NewRecorder()
+	router.ServeHTTP(procurementRecorder, procurementRequest)
+	assertProcurementConflictBusinessStatus(t, procurementRecorder, response.CodeOK)
+	if service.listCalls != 1 {
+		t.Fatalf("existing procurement admin route was not preserved: List calls=%d", service.listCalls)
+	}
+}
+
+func setupProcurementConflictRouteAccessTest(t *testing.T) (admincontract.Store, *authz.Service, string, string, uint) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	dsn := fmt.Sprintf("file:procurement_conflict_route_%d?mode=memory&cache=shared", time.Now().UnixNano())
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open SQLite: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get SQLite connection: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if err := db.AutoMigrate(&admindomain.Admin{}); err != nil {
+		t.Fatalf("migrate admins: %v", err)
+	}
+	adminRepo := adminstore.New(db)
+	noPermission := &admindomain.Admin{Username: "procurement-conflict-none", PasswordHash: "test-hash"}
+	integration := &admindomain.Admin{Username: "procurement-conflict-integration", PasswordHash: "test-hash"}
+	for _, admin := range []*admindomain.Admin{noPermission, integration} {
+		if err := adminRepo.Create(admin); err != nil {
+			t.Fatalf("create admin: %v", err)
+		}
+	}
+	authzService, err := authz.NewService(db)
+	if err != nil {
+		t.Fatalf("create authz service: %v", err)
+	}
+	if err := authzService.BootstrapBuiltinRoles(); err != nil {
+		t.Fatalf("bootstrap builtin roles: %v", err)
+	}
+	if err := authzService.SetAdminRoles(integration.ID, []string{"integration"}); err != nil {
+		t.Fatalf("assign integration role: %v", err)
+	}
+	return adminRepo, authzService, signProcurementConflictAdminToken(t, noPermission), signProcurementConflictAdminToken(t, integration), integration.ID
+}
+
+func signProcurementConflictAdminToken(t *testing.T, admin *admindomain.Admin) string {
+	t.Helper()
+	now := time.Now()
+	claims := adminauthapp.JWTClaims{
+		AdminID: admin.ID, Username: admin.Username, TokenVersion: admin.TokenVersion, Typ: jwttoken.TypeAccess,
+		RegisteredClaims: jwt.RegisteredClaims{ExpiresAt: jwt.NewNumericDate(now.Add(time.Hour)), IssuedAt: jwt.NewNumericDate(now), NotBefore: jwt.NewNumericDate(now.Add(-time.Second))},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(procurementConflictJWTSecret))
+	if err != nil {
+		t.Fatalf("sign admin token: %v", err)
+	}
+	return signed
+}
+
+func signProcurementConflictUserToken(t *testing.T) string {
+	t.Helper()
+	claims := jwt.MapClaims{"user_id": 71, "typ": jwttoken.TypeAccess, "exp": time.Now().Add(time.Hour).Unix()}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(procurementConflictJWTSecret))
+	if err != nil {
+		t.Fatalf("sign user token: %v", err)
+	}
+	return signed
+}
+
+func newProcurementConflictAccessRouter(adminRepo admincontract.Store, authzService *authz.Service, service procurementhttp.Service) *gin.Engine {
+	router := gin.New()
+	admin := router.Group("/api/v1/admin")
+	admin.Use(middleware.JWTAuthMiddleware(procurementConflictJWTSecret, adminRepo), middleware.AdminRBACMiddleware(authzService))
+	procurementhttp.RegisterAdminRoutes(admin, procurementhttp.NewAdminHandler(service))
+	return router
+}
+
+func assertProcurementConflictBusinessStatus(t *testing.T, recorder *httptest.ResponseRecorder, want int) {
+	t.Helper()
+	var got struct {
+		StatusCode int `json:"status_code"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, recorder.Body.String())
+	}
+	if got.StatusCode != want {
+		t.Fatalf("business status want %d got %d body=%s", want, got.StatusCode, recorder.Body.String())
+	}
+}
+
+type procurementConflictHTTPService struct {
+	conflicts           []procurementdomain.TradeEvidenceConflict
+	journal             []procurementdomain.TradeResponseJournalEntry
+	queryCalls          int
+	resolveCalls        int
+	listCalls           int
+	lastEventID         string
+	lastResolvedAdminID uint
+}
+
+func (s *procurementConflictHTTPService) List(procurementcontract.ListFilter) ([]procurementdomain.Order, int64, error) {
+	s.listCalls++
+	return nil, 0, nil
+}
+
+func (*procurementConflictHTTPService) StatsByStatus(procurementcontract.ListFilter) (map[string]int64, error) {
+	return map[string]int64{}, nil
+}
+
+func (*procurementConflictHTTPService) GetByID(uint) (*procurementdomain.Order, error) {
+	return nil, nil
+}
+func (*procurementConflictHTTPService) FillParentOrderNo(*procurementdomain.Order) {}
+func (*procurementConflictHTTPService) RetryManual(uint, ...procurementcontract.ManualResolution) error {
+	return nil
+}
+
+func (s *procurementConflictHTTPService) ListTradeResponseJournal(string) ([]procurementdomain.TradeResponseJournalEntry, error) {
+	return append([]procurementdomain.TradeResponseJournalEntry(nil), s.journal...), nil
+}
+
+func (*procurementConflictHTTPService) RecordTradeResponseReconciliation(uint, string, string, string, string, uint) error {
+	return nil
+}
+
+func (s *procurementConflictHTTPService) ListTradeEvidenceConflicts(eventID string) ([]procurementdomain.TradeEvidenceConflict, error) {
+	s.queryCalls++
+	s.lastEventID = eventID
+	return append([]procurementdomain.TradeEvidenceConflict(nil), s.conflicts...), nil
+}
+
+func (s *procurementConflictHTTPService) ResolveTradeEvidenceConflict(id, adminID uint, note string) error {
+	s.resolveCalls++
+	s.lastResolvedAdminID = adminID
+	for i := range s.conflicts {
+		if s.conflicts[i].ID == id {
+			resolvedBy := adminID
+			now := time.Now().UTC()
+			s.conflicts[i].Status = "resolved"
+			s.conflicts[i].ResolvedByAdminID = &resolvedBy
+			s.conflicts[i].ResolvedAt = &now
+			s.conflicts[i].ResolutionNote = note
+		}
+	}
+	return nil
+}
+
+func (*procurementConflictHTTPService) CancelManual(uint) error { return nil }

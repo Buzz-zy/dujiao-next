@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -40,6 +41,95 @@ func (adminNoopLocalMediaRecorder) RecordLocalFile(context.Context, string, stri
 type mappingConnectionProvider struct {
 	db      *gorm.DB
 	adapter upstream.Adapter
+}
+
+type fakaCodeImportAdapter struct{ upstream.Adapter }
+
+func (fakaCodeImportAdapter) GetProduct(_ context.Context, id uint) (*upstream.UpstreamProduct, error) {
+	return &upstream.UpstreamProduct{
+		ID: id, Code: "raw-upstream-code", Slug: "local-product-slug",
+		Title: jsonmap.JSON{"zh-CN": "Faka product"}, PriceAmount: "10", IsActive: true,
+		FulfillmentType: "manual",
+		FakaProcurement: &upstream.FakaProductProcurementProfile{
+			RawConfig:          json.RawMessage(`{"category":{"monthly":{}}}`),
+			RawWidget:          json.RawMessage(`null`),
+			AssessmentComplete: true,
+			Capability: upstream.FakaProcurementCapability{
+				Status: upstream.FakaCapabilityUnsupported, RequiresRace: true,
+				Reasons: []string{"product config requires race selection"},
+			},
+		},
+	}, nil
+}
+func (fakaCodeImportAdapter) GetProductByCode(_ context.Context, code string) (*upstream.UpstreamProduct, error) {
+	return &upstream.UpstreamProduct{Code: code}, nil
+}
+
+func TestFakaImportPersistsRawCodeInTemporarySQLite(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "faka-import.db")
+	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open temporary SQLite: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("get SQLite connection: %v", err)
+	}
+	defer sqlDB.Close()
+	if err := db.AutoMigrate(
+		&categorydomain.Category{}, &productdomain.Product{}, &productdomain.ProductSKU{},
+		&siteconnectiondomain.Connection{}, &mappingdomain.Mapping{}, &mappingdomain.SKUMapping{},
+	); err != nil {
+		t.Fatalf("migrate temporary SQLite: %v", err)
+	}
+	category := &categorydomain.Category{Slug: "faka-test", NameJSON: jsonmap.JSON{"zh-CN": "Faka"}, IsActive: true}
+	if err := db.Create(category).Error; err != nil {
+		t.Fatalf("create category: %v", err)
+	}
+	conn := &siteconnectiondomain.Connection{Protocol: "faka.wiki", Name: "test", BaseURL: "https://example.invalid", ApiKey: "test-id", ApiSecret: "test-key"}
+	if err := db.Create(conn).Error; err != nil {
+		t.Fatalf("create connection: %v", err)
+	}
+
+	productStore := productgormstore.NewProductStore(db)
+	skuStore := productgormstore.NewSKUStore(db)
+	mappingStore := mappinggormstore.NewMappingStore(db)
+	skuMappingStore := mappinggormstore.NewSKUMappingStore(db)
+	service, err := mappingapp.NewService(mappingapp.Options{
+		Mappings: mappingStore, SKUMappings: skuMappingStore, Products: productStore, SKUs: skuStore,
+		Categories:   categorygormstore.NewCategoryStore(db),
+		Connections:  &mappingConnectionProvider{db: db, adapter: fakaCodeImportAdapter{}},
+		Media:        adminNoopLocalMediaRecorder{},
+		Transactions: &mappingImportUoW{products: productStore, skus: skuStore, mappings: mappingStore, skuMappings: skuMappingStore},
+	})
+	if err != nil {
+		t.Fatalf("create mapping service: %v", err)
+	}
+
+	mapping, err := service.ImportUpstreamProduct(conn.ID, 73, category.ID, "")
+	if err != nil {
+		t.Fatalf("import Faka product: %v", err)
+	}
+	if mapping.UpstreamProductID != 73 || mapping.UpstreamProductCode != "raw-upstream-code" {
+		t.Fatalf("mapping identity = (%d, %q), want (73, raw-upstream-code)", mapping.UpstreamProductID, mapping.UpstreamProductCode)
+	}
+	var persisted mappingdomain.Mapping
+	if err := db.First(&persisted, mapping.ID).Error; err != nil {
+		t.Fatalf("read persisted mapping: %v", err)
+	}
+	if persisted.UpstreamProductCode != "raw-upstream-code" {
+		t.Fatalf("persisted code = %q, want raw-upstream-code", persisted.UpstreamProductCode)
+	}
+	capability, ok := persisted.FakaProcurementProfile["capability"].(map[string]interface{})
+	if !ok || capability["status"] != string(upstream.FakaCapabilityUnsupported) || capability["requires_race"] != true {
+		t.Fatalf("persisted capability = %#v", persisted.FakaProcurementProfile)
+	}
+	if persisted.FakaProcurementProfile["raw_config"] != `{"category":{"monthly":{}}}` || persisted.FakaProcurementProfile["raw_widget"] != `null` {
+		t.Fatalf("persisted raw Faka config = %#v", persisted.FakaProcurementProfile)
+	}
+	if persisted.FakaProcurementProfile["assessment_complete"] != true {
+		t.Fatalf("persisted assessment completeness = %#v", persisted.FakaProcurementProfile["assessment_complete"])
+	}
 }
 
 func (p *mappingConnectionProvider) GetByID(id uint) (*siteconnectiondomain.Connection, error) {

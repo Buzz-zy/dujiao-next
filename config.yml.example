@@ -34,6 +34,10 @@ database:
     conn_max_lifetime_seconds: 0  # 0 表示不限制
     conn_max_idle_time_seconds: 0  # 0 表示不限制
 
+# Faka Trade 本地证据缓冲。目录应位于持久化磁盘；本阶段尚未启用 S3，Faka Trade 会 fail closed。
+evidence_store:
+  local_dir: ./data/trade-evidence
+
 jwt:
   secret: your-secret-key-change-in-production-please
   expire_hours: 24  # Token 有效期（小时）

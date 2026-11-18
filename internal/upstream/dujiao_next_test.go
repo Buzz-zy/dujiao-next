@@ -32,3 +32,25 @@ func TestDownloadImageRestrictsHostAndSize(t *testing.T) {
 		t.Fatal("oversized image must be rejected")
 	}
 }
+
+func TestDujiaoNextGetProductKeepsNumericIDEndpoint(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"product":{"id":41,"slug":"dujiao-product"}}`))
+	}))
+	defer server.Close()
+
+	adapter := NewDujiaoNextAdapter(&siteconnectiondomain.Connection{BaseURL: server.URL}, t.TempDir())
+	product, err := adapter.GetProduct(context.Background(), 41)
+	if err != nil {
+		t.Fatalf("GetProduct() error = %v", err)
+	}
+	if gotPath != "/api/v1/upstream/products/41" || product.ID != 41 || product.Slug != "dujiao-product" {
+		t.Fatalf("path=%q product=(%d,%q), want numeric-ID lookup", gotPath, product.ID, product.Slug)
+	}
+	if _, ok := any(adapter).(ProductCodeAdapter); ok {
+		t.Fatal("Dujiao-Next adapter must not switch to code-based identity")
+	}
+}

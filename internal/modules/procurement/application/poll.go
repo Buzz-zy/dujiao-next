@@ -45,11 +45,27 @@ func (s *Service) PollUpstreamStatus(procurementOrderID uint) error {
 	if connection == nil {
 		return procurementcontract.ErrConnectionNotFound
 	}
+	if connection.Protocol() == constants.ConnectionProtocolFaka && strings.TrimSpace(procOrder.UpstreamOrderNo) == "" {
+		_, err := s.procRepo.UpdateStatus(procOrder.ID, constants.ProcurementStatusAccepted, constants.ProcurementStatusAwaitingVerification, map[string]interface{}{
+			"error_message": "Faka accepted procurement has no persisted tradeNo; manual verification is required",
+			"updated_at":    time.Now(),
+		})
+		return err
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	detail, err := connection.GetOrder(ctx, procOrder.UpstreamOrderID)
+	var detail *procurementcontract.UpstreamOrder
+	if connection.Protocol() == constants.ConnectionProtocolFaka {
+		querier, ok := connection.(procurementcontract.FakaOrderQuerier)
+		if !ok {
+			return fmt.Errorf("Faka string trade query is unavailable")
+		}
+		detail, err = querier.QueryFakaTrade(ctx, procOrder.UpstreamOrderNo)
+	} else {
+		detail, err = connection.GetOrder(ctx, procOrder.UpstreamOrderID)
+	}
 	if err != nil {
 		logger.Warnw("procurement_poll_status_error",
 			"procurement_order_id", procOrder.ID,
@@ -179,16 +195,35 @@ func (s *Service) requeueStalledSubmissions() {
 }
 
 func (s *Service) syncAcceptedOrder(ctx context.Context, procOrder *procurementdomain.Order) {
-	if procOrder.UpstreamOrderID == 0 {
-		return
-	}
 	connection, err := s.connections.Open(procOrder.ConnectionID)
 	if err != nil || connection == nil {
 		return
 	}
+	if connection.Protocol() != constants.ConnectionProtocolFaka && procOrder.UpstreamOrderID == 0 {
+		return
+	}
+	if connection.Protocol() == constants.ConnectionProtocolFaka && strings.TrimSpace(procOrder.UpstreamOrderNo) == "" {
+		_, err := s.procRepo.UpdateStatus(procOrder.ID, constants.ProcurementStatusAccepted, constants.ProcurementStatusAwaitingVerification, map[string]interface{}{
+			"error_message": "Faka accepted procurement has no persisted tradeNo; manual verification is required",
+			"updated_at":    time.Now(),
+		})
+		if err != nil {
+			logger.Warnw("faka_missing_trade_no_freeze_failed", "procurement_order_id", procOrder.ID, "error", err)
+		}
+		return
+	}
 	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	detail, err := connection.GetOrder(reqCtx, procOrder.UpstreamOrderID)
-	cancel()
+	defer cancel()
+	var detail *procurementcontract.UpstreamOrder
+	if connection.Protocol() == constants.ConnectionProtocolFaka {
+		querier, ok := connection.(procurementcontract.FakaOrderQuerier)
+		if !ok {
+			return
+		}
+		detail, err = querier.QueryFakaTrade(reqCtx, procOrder.UpstreamOrderNo)
+	} else {
+		detail, err = connection.GetOrder(reqCtx, procOrder.UpstreamOrderID)
+	}
 	if err != nil {
 		logger.Warnw("procurement_sync_accepted_poll_error",
 			"procurement_order_id", procOrder.ID,

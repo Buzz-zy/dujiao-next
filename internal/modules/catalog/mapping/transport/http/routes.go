@@ -12,6 +12,7 @@ func RegisterAdminRoutes(admin gin.IRoutes, handler *AdminHandler) {
 	admin.POST("/product-mappings/import", handler.ImportUpstreamProduct)
 	admin.POST("/product-mappings/batch-import", handler.BatchImportUpstreamProducts)
 	admin.POST("/product-mappings/:id/sync", handler.SyncProductMapping)
+	admin.POST("/product-mappings/:id/verify-identity", handler.VerifyFakaProductMappingIdentity)
 	admin.PUT("/product-mappings/:id/status", handler.UpdateProductMappingStatus)
 	admin.DELETE("/product-mappings/:id", handler.DeleteProductMapping)
 	admin.POST("/product-mappings/batch-sync", handler.BatchSyncProductMappings)

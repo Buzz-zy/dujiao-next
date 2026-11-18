@@ -88,6 +88,8 @@ func AutoMigrate() error {
 		&mappingdomain.Mapping{},
 		&mappingdomain.SKUMapping{},
 		&procurementdomain.Order{},
+		&procurementdomain.TradeResponseJournalEntry{},
+		&procurementdomain.TradeEvidenceConflict{},
 		&downstreamcallbackdomain.OrderRef{},
 		&reconciliationdomain.Job{},
 		&reconciliationdomain.Item{},

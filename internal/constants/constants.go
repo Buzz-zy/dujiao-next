@@ -411,16 +411,18 @@ const (
 
 // 采购单状态常量
 const (
-	ProcurementStatusPending           = "pending"
-	ProcurementStatusSubmitted         = "submitted"
-	ProcurementStatusAccepted          = "accepted"
-	ProcurementStatusRejected          = "rejected"
-	ProcurementStatusFailed            = "failed"
-	ProcurementStatusPartiallyRefunded = "partially_refunded"
-	ProcurementStatusFulfilled         = "fulfilled"
-	ProcurementStatusCompleted         = "completed"
-	ProcurementStatusRefunded          = "refunded"
-	ProcurementStatusCanceled          = "canceled"
+	ProcurementStatusPending              = "pending"
+	ProcurementStatusSubmitting           = "submitting"
+	ProcurementStatusAwaitingVerification = "awaiting_verification"
+	ProcurementStatusSubmitted            = "submitted"
+	ProcurementStatusAccepted             = "accepted"
+	ProcurementStatusRejected             = "rejected"
+	ProcurementStatusFailed               = "failed"
+	ProcurementStatusPartiallyRefunded    = "partially_refunded"
+	ProcurementStatusFulfilled            = "fulfilled"
+	ProcurementStatusCompleted            = "completed"
+	ProcurementStatusRefunded             = "refunded"
+	ProcurementStatusCanceled             = "canceled"
 )
 
 // 对接连接状态常量
@@ -433,6 +435,7 @@ const (
 // 对接协议类型常量
 const (
 	ConnectionProtocolDujiaoNext = "dujiao-next"
+	ConnectionProtocolFaka       = "faka.wiki"
 )
 
 // API 凭证状态常量

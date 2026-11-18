@@ -10,6 +10,7 @@ import (
 	"github.com/dujiao-next/internal/constants"
 	procurementcontract "github.com/dujiao-next/internal/modules/procurement/contract"
 	procurementgormstore "github.com/dujiao-next/internal/modules/procurement/infrastructure/gormstore"
+	siteconnectionapp "github.com/dujiao-next/internal/modules/siteconnection/application"
 )
 
 type procurementCallbackStatusFixture struct {
@@ -19,6 +20,32 @@ type procurementCallbackStatusFixture struct {
 	callbackStatus            string
 	expectedProcurementStatus string
 	expectedOrderStatus       string
+}
+
+func TestFakaCallbackCannotBypassQueryDeliveryGate(t *testing.T) {
+	db := setupProcurementTestDB(t)
+	order := createProcTestOrder(t, db, "FAKA-CALLBACK-BLOCKED", constants.OrderStatusFulfilling, constants.FulfillmentTypeUpstream)
+	connSvc := newTestSiteConnectionService(db, "test-key", t.TempDir())
+	conn, err := connSvc.Create(siteconnectionapp.CreateInput{Name: "faka", BaseURL: "http://example.invalid", ApiKey: "id", ApiSecret: "key", Protocol: constants.ConnectionProtocolFaka})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proc := createTestProcurementOrder(t, db, conn.ID, order.ID, order.OrderNo, constants.ProcurementStatusAccepted)
+	svc := newTestProcurementService(db, connSvc)
+	if err := svc.HandleUpstreamCallback(proc.ID, "delivered", &procurementcontract.Fulfillment{Payload: "CARD-001"}); err == nil {
+		t.Fatal("Faka callback bypassed query delivery gate")
+	}
+	var stored ProcurementOrder
+	if err := db.First(&stored, proc.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := db.Model(&fulfillmentdomain.Fulfillment{}).Where("order_id = ?", order.ID).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != constants.ProcurementStatusAccepted || count != 0 {
+		t.Fatalf("status=%q fulfillments=%d", stored.Status, count)
+	}
 }
 
 func assertProcurementCallbackStatus(t *testing.T, fixture procurementCallbackStatusFixture) {

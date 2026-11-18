@@ -13,6 +13,9 @@ type Options struct {
 	DownstreamCallback procurementcontract.DownstreamCallbackEnqueuer
 	BotNotifier        procurementcontract.BotFulfillmentNotifier
 	Notifications      procurementcontract.FailureNotifier
+	DecisionAudit      procurementcontract.ManualDecisionAudit
+	EvidenceStore      procurementcontract.EvidenceStore
+	EvidenceConfirmer  procurementcontract.IndependentEvidenceConfirmer
 }
 
 type Service struct {
@@ -26,6 +29,9 @@ type Service struct {
 	downstreamCallback procurementcontract.DownstreamCallbackEnqueuer
 	botNotifier        procurementcontract.BotFulfillmentNotifier
 	notifications      procurementcontract.FailureNotifier
+	decisionAudit      procurementcontract.ManualDecisionAudit
+	evidenceStore      procurementcontract.EvidenceStore
+	evidenceConfirmer  procurementcontract.IndependentEvidenceConfirmer
 }
 
 var _ procurementcontract.UseCase = (*Service)(nil)
@@ -37,5 +43,6 @@ func NewService(options Options) *Service {
 		connections: options.Connections, queue: options.Queue,
 		orderLifecycle: options.OrderLifecycle, downstreamCallback: options.DownstreamCallback,
 		botNotifier: options.BotNotifier, notifications: options.Notifications,
+		decisionAudit: options.DecisionAudit, evidenceStore: options.EvidenceStore, evidenceConfirmer: options.EvidenceConfirmer,
 	}
 }

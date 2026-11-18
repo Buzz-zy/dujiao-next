@@ -95,6 +95,13 @@ func (s *Service) importUpstreamProduct(connectionID uint, upstreamProductID uin
 	if upProduct == nil {
 		return nil, mappingcontract.ErrUpstreamProductNotFound
 	}
+	upstreamProductCode := ""
+	if _, requiresCode := adapter.(upstream.ProductCodeAdapter); requiresCode {
+		if upProduct.Code == "" {
+			return nil, fmt.Errorf("upstream product %d has no persistent code", upstreamProductID)
+		}
+		upstreamProductCode = upProduct.Code
+	}
 	// 新版上游对下架商品返回 200 + is_active=false → 同样禁止导入
 	if !upProduct.IsActive {
 		return nil, mappingcontract.ErrUpstreamProductNotFound
@@ -261,10 +268,16 @@ func (s *Service) importUpstreamProduct(connectionID uint, upstreamProductID uin
 		}
 
 		now := time.Now()
+		var fakaProcurementProfile jsonmap.JSON
+		if upProduct.FakaProcurement != nil {
+			fakaProcurementProfile = upProduct.FakaProcurement.MappingSnapshot()
+		}
 		mapping = &mappingdomain.Mapping{
 			ConnectionID:            connectionID,
 			LocalProductID:          product.ID,
 			UpstreamProductID:       upstreamProductID,
+			UpstreamProductCode:     upstreamProductCode,
+			FakaProcurementProfile:  fakaProcurementProfile,
 			UpstreamFulfillmentType: upstreamFulfillmentType,
 			IsActive:                true,
 			LastSyncedAt:            &now,

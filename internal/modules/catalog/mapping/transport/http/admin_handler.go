@@ -25,6 +25,7 @@ type ProductMappingService interface {
 	BatchImportUpstreamProducts(connectionID uint, upstreamProductIDs []uint, categoryID uint, autoCreateCategory bool) ([]mappingapp.BatchUpstreamProductImportOutcome, error)
 	SyncProduct(mappingID uint) error
 	SetActive(id uint, active bool) error
+	VerifyFakaIdentity(mappingID uint) error
 	Delete(id uint) error
 	ListUpstreamProducts(connectionID uint, page, pageSize int) (*upstream.ProductListResult, error)
 	GetMappedUpstreamIDs(connectionID uint) ([]uint, error)
@@ -54,9 +55,10 @@ func (h *AdminHandler) GetProductMappings(c *gin.Context) {
 	upstreamStatus := c.Query("upstream_status")
 	if upstreamStatus != "" {
 		validStatuses := map[string]bool{
-			mappingdomain.UpstreamStatusActive:   true,
-			mappingdomain.UpstreamStatusInactive: true,
-			mappingdomain.UpstreamStatusDeleted:  true,
+			mappingdomain.UpstreamStatusActive:        true,
+			mappingdomain.UpstreamStatusInactive:      true,
+			mappingdomain.UpstreamStatusDeleted:       true,
+			mappingdomain.UpstreamStatusIdentityError: true,
 		}
 		if !validStatuses[upstreamStatus] {
 			ginutil.RespondError(c, response.CodeBadRequest, "error.invalid_upstream_status", nil)
@@ -85,6 +87,23 @@ func (h *AdminHandler) GetProductMappings(c *gin.Context) {
 
 	pagination := response.BuildPagination(page, pageSize, total)
 	response.SuccessWithPage(c, mappings, pagination)
+}
+
+func (h *AdminHandler) VerifyFakaProductMappingIdentity(c *gin.Context) {
+	id, err := ginutil.ParseParamUint(c, "id")
+	if err != nil {
+		ginutil.RespondError(c, response.CodeBadRequest, "error.bad_request", err)
+		return
+	}
+	if err := h.service.VerifyFakaIdentity(id); err != nil {
+		if errors.Is(err, mappingcontract.ErrMappingNotFound) {
+			ginutil.RespondError(c, response.CodeNotFound, "error.mapping_not_found", nil)
+			return
+		}
+		ginutil.RespondErrorWithMsg(c, response.CodeBadRequest, err.Error(), nil)
+		return
+	}
+	response.Success(c, gin.H{"verified": true, "is_active": true})
 }
 
 // GetProductMapping 获取商品映射详情

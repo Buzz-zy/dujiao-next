@@ -3,17 +3,20 @@ package procurement_test
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	fulfillmentdomain "github.com/dujiao-next/internal/modules/fulfillment/domain"
 	orderdomain "github.com/dujiao-next/internal/modules/order/domain"
 
 	"github.com/dujiao-next/internal/constants"
 	ordergormstore "github.com/dujiao-next/internal/modules/order/infrastructure/gormstore"
 	procurementapp "github.com/dujiao-next/internal/modules/procurement/application"
+	procurementcontract "github.com/dujiao-next/internal/modules/procurement/contract"
 	procurementgormstore "github.com/dujiao-next/internal/modules/procurement/infrastructure/gormstore"
 	procurementorder "github.com/dujiao-next/internal/modules/procurement/infrastructure/orderreader"
 	procurementupstream "github.com/dujiao-next/internal/modules/procurement/infrastructure/upstreamgateway"
@@ -133,6 +136,175 @@ func TestPollUpstreamStatus_FulfilledMappedToDelivered(t *testing.T) {
 	}
 }
 
+func TestFakaPollUsesPersistedStringTradeNoWithoutAutoDelivery(t *testing.T) {
+	cases := []struct{ name, response string }{
+		{"unpaid", `{"code":200,"data":{"status":0,"secret":"CARD-001","widget":null}}`},
+		{"paid empty secret", `{"code":200,"data":{"status":1,"secret":"","widget":null}}`},
+		{"paid wait prompt", `{"code":200,"data":{"status":1,"secret":"等待人工发货","widget":null}}`},
+		{"paid unverified secret", `{"code":200,"data":{"status":1,"secret":"CARD-001","widget":{"email":"buyer@example.com"}}}`},
+		{"malformed response", `{broken`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := setupProcurementTestDB(t)
+			order := createProcTestOrder(t, db, "FAKA-QUERY-CHILD", constants.OrderStatusFulfilling, constants.FulfillmentTypeUpstream)
+			var queryCalls, tradeCalls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/shared/commodity/query":
+					queryCalls.Add(1)
+					if err := r.ParseForm(); err != nil {
+						t.Error(err)
+					}
+					if r.Form.Get("tradeNo") != "TR-string-abc" || r.Form.Get("app_key") != "" {
+						t.Errorf("unsafe form: %v", r.Form)
+					}
+					_, _ = io.WriteString(w, tc.response)
+				case "/shared/commodity/trade":
+					tradeCalls.Add(1)
+				default:
+					t.Errorf("unexpected endpoint %s", r.URL.Path)
+				}
+			}))
+			defer server.Close()
+			connSvc := newTestSiteConnectionService(db, "test-key", t.TempDir())
+			conn, err := connSvc.Create(siteconnectionapp.CreateInput{Name: "faka", BaseURL: server.URL, ApiKey: "id", ApiSecret: "key", Protocol: constants.ConnectionProtocolFaka})
+			if err != nil {
+				t.Fatal(err)
+			}
+			proc := createTestProcurementOrder(t, db, conn.ID, order.ID, order.OrderNo, constants.ProcurementStatusAccepted)
+			if err := db.Model(proc).Updates(map[string]any{"upstream_order_no": "TR-string-abc", "upstream_order_id": 0}).Error; err != nil {
+				t.Fatal(err)
+			}
+			svc := newTestProcurementService(db, connSvc)
+			if err := svc.PollUpstreamStatus(proc.ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := svc.PollUpstreamStatus(proc.ID); err != nil {
+				t.Fatal(err)
+			}
+			var stored ProcurementOrder
+			if err := db.First(&stored, proc.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			var fulfillmentCount int64
+			if err := db.Model(&fulfillmentdomain.Fulfillment{}).Where("order_id = ?", order.ID).Count(&fulfillmentCount).Error; err != nil {
+				t.Fatal(err)
+			}
+			if stored.Status != constants.ProcurementStatusAccepted || fulfillmentCount != 0 || queryCalls.Load() != 2 || tradeCalls.Load() != 0 {
+				t.Fatalf("status=%q fulfillments=%d queries=%d trades=%d", stored.Status, fulfillmentCount, queryCalls.Load(), tradeCalls.Load())
+			}
+		})
+	}
+}
+
+func TestFakaManualTradeNoRecoveryQueriesWithoutRetrading(t *testing.T) {
+	db := setupProcurementTestDB(t)
+	order := createProcTestOrder(t, db, "FAKA-MANUAL-QUERY", constants.OrderStatusFulfilling, constants.FulfillmentTypeUpstream)
+	var queryCalls, tradeCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/shared/commodity/query":
+			queryCalls.Add(1)
+			if err := r.ParseForm(); err != nil {
+				t.Error(err)
+			}
+			if r.Form.Get("tradeNo") != "TR-recovered-A" {
+				t.Errorf("tradeNo=%q", r.Form.Get("tradeNo"))
+			}
+			_, _ = io.WriteString(w, `{"code":200,"data":{"status":0,"secret":"","widget":null}}`)
+		case "/shared/commodity/trade":
+			tradeCalls.Add(1)
+		}
+	}))
+	defer server.Close()
+	connSvc := newTestSiteConnectionService(db, "test-key", t.TempDir())
+	conn, err := connSvc.Create(siteconnectionapp.CreateInput{Name: "faka", BaseURL: server.URL, ApiKey: "id", ApiSecret: "key", Protocol: constants.ConnectionProtocolFaka})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proc := createTestProcurementOrder(t, db, conn.ID, order.ID, order.OrderNo, constants.ProcurementStatusAwaitingVerification)
+	audit := &recordingProcurementDecisionAudit{}
+	svc := newTestProcurementService(db, connSvc, audit)
+	if err := svc.PollUpstreamStatus(proc.ID); err != nil {
+		t.Fatal(err)
+	}
+	if queryCalls.Load() != 0 {
+		t.Fatal("unknown procurement was queried without tradeNo")
+	}
+	if err := svc.RetryManual(proc.ID, procurementcontract.ManualResolution{Mode: "order_found", OperatorAdminID: 7, TradeNo: "TR-recovered-A", Reason: "verified in supplier console"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.PollUpstreamStatus(proc.ID); err != nil {
+		t.Fatal(err)
+	}
+	if queryCalls.Load() != 1 || tradeCalls.Load() != 0 || audit.calls != 1 {
+		t.Fatalf("queries=%d trades=%d audits=%d", queryCalls.Load(), tradeCalls.Load(), audit.calls)
+	}
+}
+
+func TestFakaAcceptedWithoutTradeNoStaysFrozenFromQueryAndTrade(t *testing.T) {
+	db := setupProcurementTestDB(t)
+	order := createProcTestOrder(t, db, "FAKA-MISSING-TRADE-NO", constants.OrderStatusFulfilling, constants.FulfillmentTypeUpstream)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls.Add(1) }))
+	defer server.Close()
+	connSvc := newTestSiteConnectionService(db, "test-key", t.TempDir())
+	conn, err := connSvc.Create(siteconnectionapp.CreateInput{Name: "faka", BaseURL: server.URL, ApiKey: "id", ApiSecret: "key", Protocol: constants.ConnectionProtocolFaka})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proc := createTestProcurementOrder(t, db, conn.ID, order.ID, order.OrderNo, constants.ProcurementStatusAccepted)
+	svc := newTestProcurementService(db, connSvc)
+	if err := svc.PollUpstreamStatus(proc.ID); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("query or trade was sent without tradeNo: %d", calls.Load())
+	}
+	var stored ProcurementOrder
+	if err := db.First(&stored, proc.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != constants.ProcurementStatusAwaitingVerification {
+		t.Fatalf("status=%q", stored.Status)
+	}
+}
+
+func TestFakaPeriodicAcceptedSweepUsesStringTradeNo(t *testing.T) {
+	db := setupProcurementTestDB(t)
+	order := createProcTestOrder(t, db, "FAKA-PERIODIC-QUERY", constants.OrderStatusFulfilling, constants.FulfillmentTypeUpstream)
+	var queries atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/shared/commodity/query" {
+			t.Errorf("unexpected endpoint %s", r.URL.Path)
+			return
+		}
+		queries.Add(1)
+		if err := r.ParseForm(); err != nil {
+			t.Error(err)
+		}
+		if r.Form.Get("tradeNo") != "TR-periodic" {
+			t.Errorf("tradeNo=%q", r.Form.Get("tradeNo"))
+		}
+		_, _ = io.WriteString(w, `{"code":200,"data":{"status":1,"secret":"CARD-001","widget":null}}`)
+	}))
+	defer server.Close()
+	connSvc := newTestSiteConnectionService(db, "test-key", t.TempDir())
+	conn, err := connSvc.Create(siteconnectionapp.CreateInput{Name: "faka", BaseURL: server.URL, ApiKey: "id", ApiSecret: "key", Protocol: constants.ConnectionProtocolFaka})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proc := createTestProcurementOrder(t, db, conn.ID, order.ID, order.OrderNo, constants.ProcurementStatusAccepted)
+	if err := db.Model(proc).Update("upstream_order_no", "TR-periodic").Error; err != nil {
+		t.Fatal(err)
+	}
+	newTestProcurementService(db, connSvc).SyncAcceptedOrders()
+	if queries.Load() != 1 {
+		t.Fatalf("periodic Faka queries=%d", queries.Load())
+	}
+}
+
 // 巡检必须覆盖全部 accepted 采购单，而不是只看最新的一页。
 func TestSyncAcceptedOrders_WalksAllPages(t *testing.T) {
 	db := setupProcurementTestDB(t)
@@ -179,6 +351,10 @@ func TestSyncAcceptedOrders_RequeuesStalledSubmissions(t *testing.T) {
 	stalled := createTestProcurementOrder(t, db, 1, order.ID, order.OrderNo, constants.ProcurementStatusPending)
 	db.Model(stalled).UpdateColumn("updated_at", time.Now().Add(-time.Hour))
 	fresh := createTestProcurementOrder(t, db, 1, order.ID+1, "PROC-STALLED-002", constants.ProcurementStatusPending)
+	submitting := createTestProcurementOrder(t, db, 1, order.ID+2, "PROC-SUBMITTING-003", constants.ProcurementStatusSubmitting)
+	unknown := createTestProcurementOrder(t, db, 1, order.ID+3, "PROC-UNKNOWN-004", constants.ProcurementStatusAwaitingVerification)
+	db.Model(submitting).UpdateColumn("updated_at", time.Now().Add(-time.Hour))
+	db.Model(unknown).UpdateColumn("updated_at", time.Now().Add(-time.Hour))
 
 	queue := &recordingEnqueuer{}
 	svc := procurementapp.NewService(procurementapp.Options{
@@ -189,6 +365,6 @@ func TestSyncAcceptedOrders_RequeuesStalledSubmissions(t *testing.T) {
 	})
 	svc.SyncAcceptedOrders()
 	if len(queue.submitted) != 1 || queue.submitted[0] != stalled.ID {
-		t.Fatalf("expected only stalled procurement %d requeued (fresh %d skipped), got %v", stalled.ID, fresh.ID, queue.submitted)
+		t.Fatalf("expected only stalled pending procurement %d requeued (fresh %d, submitting %d, unknown %d skipped), got %v", stalled.ID, fresh.ID, submitting.ID, unknown.ID, queue.submitted)
 	}
 }

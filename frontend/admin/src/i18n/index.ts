@@ -334,7 +334,7 @@ const messages = {
       upstreamStatus: {
         inactive: '上游已下架',
         deleted: '上游已删除',
-      },
+        identityError: '商品身份异常',
       actions: {
         sync: '同步',
         syncing: '同步中...',
@@ -434,6 +434,7 @@ const messages = {
         allUpstreamStatus: '全部',
         upstreamInactive: '上游已下架',
         upstreamDeleted: '上游已删除',
+        identityError: '身份异常',
         productStatusPlaceholder: '商品状态',
         allProductStatus: '全部',
         productActive: '已启用',
@@ -4861,7 +4862,7 @@ const messages = {
       upstreamStatus: {
         inactive: '上游已下架',
         deleted: '上游已刪除',
-      },
+        identityError: '商品身分異常',
       actions: {
         sync: '同步',
         syncing: '同步中...',
@@ -4961,6 +4962,7 @@ const messages = {
         allUpstreamStatus: '全部',
         upstreamInactive: '上游已下架',
         upstreamDeleted: '上游已刪除',
+        identityError: '身份異常',
         productStatusPlaceholder: '商品狀態',
         allProductStatus: '全部',
         productActive: '已啟用',
@@ -9388,7 +9390,7 @@ const messages = {
       upstreamStatus: {
         inactive: 'Delisted upstream',
         deleted: 'Deleted upstream',
-      },
+        identityError: 'Product identity error',
       actions: {
         sync: 'Sync',
         syncing: 'Syncing...',
@@ -9488,6 +9490,7 @@ const messages = {
         allUpstreamStatus: 'All',
         upstreamInactive: 'Upstream delisted',
         upstreamDeleted: 'Upstream deleted',
+        identityError: 'Identity error',
         productStatusPlaceholder: 'Product status',
         allProductStatus: 'All',
         productActive: 'Enabled',

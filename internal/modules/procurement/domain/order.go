@@ -19,7 +19,7 @@ type Order struct {
 	LocalOrderNo             string       `gorm:"type:varchar(64);index" json:"local_order_no"`
 	UpstreamOrderID          uint         `json:"-"`
 	UpstreamOrderNo          string       `gorm:"type:varchar(64);index" json:"upstream_order_no,omitempty"`
-	Status                   string       `gorm:"type:varchar(20);not null;default:'pending';index" json:"status"`
+	Status                   string       `gorm:"type:varchar(32);not null;default:'pending';index" json:"status"`
 	UpstreamAmount           money.Amount `gorm:"type:decimal(20,2);not null;default:0" json:"upstream_amount"`
 	UpstreamCurrency         string       `gorm:"type:varchar(10);not null;default:''" json:"upstream_currency"`
 	LocalSellAmount          money.Amount `gorm:"type:decimal(20,2);not null;default:0" json:"local_sell_amount"`
@@ -62,6 +62,46 @@ func (o *Order) TruncateUpstreamPayload(maxLines int) {
 		o.UpstreamPayload = strings.Join(lines[:maxLines], "\n")
 	}
 }
+
+// TradeResponseJournalEntry stores minimal, append-only upstream Trade evidence.
+type TradeResponseJournalEntry struct {
+	ID                 uint      `gorm:"primarykey" json:"id"`
+	SourceEventID      *string   `gorm:"type:varchar(64);uniqueIndex:ux_procurement_trade_journal_source_event_id" json:"source_event_id,omitempty"`
+	SourceEventHash    *string   `gorm:"type:varchar(64)" json:"-"`
+	ProcurementOrderID uint      `gorm:"not null;index" json:"procurement_order_id"`
+	TraceID            string    `gorm:"type:varchar(64);not null;index" json:"trace_id"`
+	UpstreamTradeNo    string    `gorm:"type:varchar(128);not null;default:''" json:"upstream_trade_no"`
+	Amount             string    `gorm:"type:varchar(64);not null;default:''" json:"amount"`
+	ResponseTime       time.Time `gorm:"not null;index" json:"response_time"`
+	EventType          string    `gorm:"type:varchar(64);not null;index" json:"event_type"`
+	CreatedAt          time.Time `gorm:"not null;index" json:"created_at"`
+	OperatorAdminID    *uint     `gorm:"index" json:"operator_admin_id,omitempty"`
+	ConfirmedTradeNo   string    `gorm:"type:varchar(128);not null;default:''" json:"confirmed_trade_no,omitempty"`
+	ConfirmedAmount    string    `gorm:"type:varchar(64);not null;default:''" json:"confirmed_amount,omitempty"`
+	ReconciliationNote string    `gorm:"type:text" json:"reconciliation_note,omitempty"`
+}
+
+// TradeEvidenceConflict is an append-preserving record of a conflicting event payload.
+type TradeEvidenceConflict struct {
+	ID                 uint       `gorm:"primarykey" json:"id"`
+	ConflictKey        string     `gorm:"type:varchar(64);not null;uniqueIndex" json:"conflict_key"`
+	EventID            string     `gorm:"type:varchar(64);not null;index" json:"event_id"`
+	ProcurementOrderID uint       `gorm:"not null;index" json:"procurement_order_id"`
+	TraceID            string     `gorm:"type:varchar(64);not null;index" json:"trace_id"`
+	ConflictType       string     `gorm:"type:varchar(64);not null" json:"conflict_type"`
+	ExistingEventHash  string     `gorm:"type:varchar(64);not null" json:"existing_event_hash"`
+	IncomingEventHash  string     `gorm:"type:varchar(64);not null" json:"incoming_event_hash"`
+	FirstSeenAt        time.Time  `gorm:"not null" json:"first_seen_at"`
+	LastSeenAt         time.Time  `gorm:"not null" json:"last_seen_at"`
+	Status             string     `gorm:"type:varchar(32);not null;index" json:"status"`
+	ResolutionNote     string     `gorm:"type:text" json:"resolution_note,omitempty"`
+	ResolvedByAdminID  *uint      `gorm:"index" json:"resolved_by_admin_id,omitempty"`
+	ResolvedAt         *time.Time `json:"resolved_at,omitempty"`
+}
+
+func (TradeEvidenceConflict) TableName() string { return "procurement_trade_evidence_conflicts" }
+
+func (TradeResponseJournalEntry) TableName() string { return "procurement_trade_response_journal" }
 
 // LocalOrder 是采购应用读取的订单最小快照，同时保持管理端所需的 JSON 形状。
 type LocalOrder struct {

@@ -26,6 +26,101 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+func fetchMappedUpstreamProduct(ctx context.Context, adapter upstream.Adapter, mapping *mappingdomain.Mapping) (*upstream.UpstreamProduct, error) {
+	codeAdapter, usesCode := adapter.(upstream.ProductCodeAdapter)
+	if !usesCode {
+		return adapter.GetProduct(ctx, mapping.UpstreamProductID)
+	}
+	if mapping.UpstreamProductCode == "" {
+		return nil, upstream.ErrFakaProductCodeMissing
+	}
+	product, err := codeAdapter.GetProductByCode(ctx, mapping.UpstreamProductCode)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateFakaProductMapping(mapping, product); err != nil {
+		return nil, err
+	}
+	return product, nil
+}
+
+func validateFakaProductMapping(mapping *mappingdomain.Mapping, product *upstream.UpstreamProduct) error {
+	if mapping.UpstreamProductCode == "" {
+		return upstream.ErrFakaProductCodeMissing
+	}
+	if product == nil {
+		return &upstream.FakaIdentityError{
+			Message:      fmt.Sprintf("faka product lookup returned no product for mapping id/code=%d/%q", mapping.UpstreamProductID, mapping.UpstreamProductCode),
+			ProductIDs:   []uint{mapping.UpstreamProductID},
+			ProductCodes: []string{mapping.UpstreamProductCode},
+		}
+	}
+	if product.ID != mapping.UpstreamProductID || product.Code != mapping.UpstreamProductCode {
+		return &upstream.FakaIdentityError{
+			Message:      fmt.Sprintf("faka mapping identity mismatch: mapping id/code=%d/%q, upstream id/code=%d/%q", mapping.UpstreamProductID, mapping.UpstreamProductCode, product.ID, product.Code),
+			ProductIDs:   []uint{mapping.UpstreamProductID, product.ID},
+			ProductCodes: []string{mapping.UpstreamProductCode, product.Code},
+		}
+	}
+	return nil
+}
+
+func isFakaIdentityError(err error) bool {
+	var identityErr *upstream.FakaIdentityError
+	return errors.As(err, &identityErr)
+}
+
+func (s *Service) pauseFakaMapping(mapping *mappingdomain.Mapping, cause error) error {
+	mapping.IsActive = false
+	mapping.UpstreamStatus = mappingdomain.UpstreamStatusIdentityError
+	invalidateFakaCapabilitySnapshot(mapping, cause.Error())
+	if err := s.mappings.Update(mapping); err != nil {
+		return fmt.Errorf("pause mapping %d after upstream identity error: %w", mapping.ID, err)
+	}
+	logger.Errorw("upstream_product_identity_error_mapping_paused",
+		"mapping_id", mapping.ID,
+		"connection_id", mapping.ConnectionID,
+		"upstream_product_id", mapping.UpstreamProductID,
+		"upstream_product_code", mapping.UpstreamProductCode,
+		"error", cause,
+	)
+	return nil
+}
+
+func invalidateFakaCapabilitySnapshot(mapping *mappingdomain.Mapping, reason string) {
+	if mapping == nil || len(mapping.FakaProcurementProfile) == 0 {
+		return
+	}
+	mapping.FakaProcurementProfile["snapshot_valid"] = false
+	mapping.FakaProcurementProfile["invalidated_reason"] = reason
+}
+
+func (s *Service) pauseFakaMappingsForIdentityConflict(mappings []mappingdomain.Mapping, cause error) error {
+	var identityErr *upstream.FakaIdentityError
+	if !errors.As(cause, &identityErr) {
+		return nil
+	}
+	conflictIDs := make(map[uint]struct{}, len(identityErr.ProductIDs))
+	for _, id := range identityErr.ProductIDs {
+		conflictIDs[id] = struct{}{}
+	}
+	conflictCodes := make(map[string]struct{}, len(identityErr.ProductCodes))
+	for _, code := range identityErr.ProductCodes {
+		conflictCodes[code] = struct{}{}
+	}
+	for i := range mappings {
+		_, idConflict := conflictIDs[mappings[i].UpstreamProductID]
+		_, codeConflict := conflictCodes[mappings[i].UpstreamProductCode]
+		if !idConflict && !codeConflict {
+			continue
+		}
+		if err := s.pauseFakaMapping(&mappings[i], cause); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // SyncProduct 同步单个映射商品的上游数据（全量同步）
 func (s *Service) SyncProduct(mappingID uint) error {
 	mapping, err := s.mappings.GetByID(mappingID)
@@ -48,12 +143,42 @@ func (s *Service) SyncProduct(mappingID uint) error {
 	if err != nil {
 		return err
 	}
+	if _, isFaka := adapter.(upstream.ProductCodeAdapter); isFaka && mapping.UpstreamStatus == mappingdomain.UpstreamStatusIdentityError {
+		return mappingcontract.ErrIdentityVerificationRequired
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	upProduct, err := adapter.GetProduct(ctx, mapping.UpstreamProductID)
+	upProduct, err := fetchMappedUpstreamProduct(ctx, adapter, mapping)
 	if err != nil {
+		if _, isFaka := adapter.(upstream.ProductCodeAdapter); isFaka {
+			invalidateFakaCapabilitySnapshot(mapping, err.Error())
+			if !isFakaIdentityError(err) && !errors.Is(err, upstream.ErrUpstreamProductDeleted) && !errors.Is(err, upstream.ErrFakaProductCodeMissing) {
+				if updateErr := s.mappings.Update(mapping); updateErr != nil {
+					return fmt.Errorf("invalidate stale faka capability snapshot: %w", updateErr)
+				}
+			}
+		}
+		if _, isFaka := adapter.(upstream.ProductCodeAdapter); isFaka && isFakaIdentityError(err) {
+			if pauseErr := s.pauseFakaMapping(mapping, err); pauseErr != nil {
+				return pauseErr
+			}
+			activeMappings, listErr := s.mappings.ListActiveByConnection(mapping.ConnectionID)
+			if listErr != nil {
+				return fmt.Errorf("list mappings after faka identity conflict: %w", listErr)
+			}
+			if pauseErr := s.pauseFakaMappingsForIdentityConflict(activeMappings, err); pauseErr != nil {
+				return pauseErr
+			}
+			return fmt.Errorf("faka product identity check failed: %w", err)
+		}
+		if _, isFaka := adapter.(upstream.ProductCodeAdapter); isFaka && (errors.Is(err, upstream.ErrUpstreamProductDeleted) || errors.Is(err, upstream.ErrFakaProductCodeMissing)) {
+			if pauseErr := s.pauseFakaMapping(mapping, err); pauseErr != nil {
+				return pauseErr
+			}
+			return fmt.Errorf("faka product identity check failed: %w", err)
+		}
 		// 上游软删除 → 标记本地为 deleted，自动停用映射
 		if errors.Is(err, upstream.ErrUpstreamProductDeleted) {
 			now := time.Now()
@@ -209,6 +334,9 @@ func (s *Service) SyncProduct(mappingID uint) error {
 		upFulfillment = constants.FulfillmentTypeManual
 	}
 	mapping.UpstreamFulfillmentType = upFulfillment
+	if upProduct.FakaProcurement != nil {
+		mapping.FakaProcurementProfile = upProduct.FakaProcurement.MappingSnapshot()
+	}
 	mapping.UpstreamStatus = mappingdomain.UpstreamStatusActive
 	mapping.LastSyncedAt = &now
 	return s.mappings.Update(mapping)
@@ -509,6 +637,13 @@ func (s *Service) SyncConnectionStock(connectionID uint, connMappings []mappingd
 		})
 		cancel()
 		if err != nil {
+			if _, isFaka := adapter.(upstream.ProductCodeAdapter); isFaka && isFakaIdentityError(err) {
+				pauseErr := s.pauseFakaMappingsForIdentityConflict(connMappings, err)
+				if pauseErr != nil {
+					return fmt.Errorf("upstream product identity conflict: %w (pause mappings: %v)", err, pauseErr)
+				}
+				return fmt.Errorf("upstream product identity conflict: %w", err)
+			}
 			// 增量拉取失败时回退到全量
 			if updatedAfter != nil {
 				logger.Warnw("sync_incremental_failed_fallback_full", "connection_id", connectionID, "error", err)
@@ -570,6 +705,9 @@ func (s *Service) SyncConnectionStock(connectionID uint, connMappings []mappingd
 	isFullSync := updatedAfter == nil
 	for i := range connMappings {
 		mapping := &connMappings[i]
+		if _, isFaka := adapter.(upstream.ProductCodeAdapter); isFaka && mapping.UpstreamStatus == mappingdomain.UpstreamStatusIdentityError {
+			continue
+		}
 		upProduct, ok := upstreamProducts[mapping.UpstreamProductID]
 		if !ok {
 			if !isFullSync {
@@ -578,7 +716,14 @@ func (s *Service) SyncConnectionStock(connectionID uint, connMappings []mappingd
 			}
 			// 全量模式 + 上游真实支持 include_inactive + 本次拉取完整：
 			// 下架商品也应在列表中，仍然 missing 即说明上游已软删除。
-			if includesInactive && fetchComplete {
+			_, isFaka := adapter.(upstream.ProductCodeAdapter)
+			if fetchComplete && (includesInactive || isFaka) {
+				if isFaka {
+					if err := s.pauseFakaMapping(mapping, upstream.ErrUpstreamProductDeleted); err != nil {
+						return err
+					}
+					continue
+				}
 				_ = s.markUpstreamUnavailable(mapping, mappingdomain.UpstreamStatusDeleted, now)
 				continue
 			}
@@ -594,6 +739,14 @@ func (s *Service) SyncConnectionStock(connectionID uint, connMappings []mappingd
 			continue
 		}
 		// 上游 is_active=false → 标记为 inactive
+		if _, isFaka := adapter.(upstream.ProductCodeAdapter); isFaka {
+			if err := validateFakaProductMapping(mapping, &upProduct); err != nil {
+				if pauseErr := s.pauseFakaMapping(mapping, err); pauseErr != nil {
+					return pauseErr
+				}
+				continue
+			}
+		}
 		if !upProduct.IsActive {
 			_ = s.markUpstreamUnavailable(mapping, mappingdomain.UpstreamStatusInactive, now)
 			continue
@@ -621,6 +774,9 @@ func (s *Service) SyncConnectionStock(connectionID uint, connMappings []mappingd
 // syncProductFromData 使用已拉取的上游数据同步单个映射（不再发 HTTP 请求）
 // 调用方应保证 upProduct.IsActive == true（下架/删除分支由 caller 处理）
 func (s *Service) syncProductFromData(mapping *mappingdomain.Mapping, conn *siteconnectiondomain.Connection, upProduct *upstream.UpstreamProduct, now *time.Time) {
+	if mapping != nil && mapping.UpstreamStatus == mappingdomain.UpstreamStatusIdentityError && conn != nil && conn.Protocol == constants.ConnectionProtocolFaka {
+		return
+	}
 	// ── 1. 同步本地商品字段 ──
 	localProduct, err := s.products.GetByID(strconv.FormatUint(uint64(mapping.LocalProductID), 10))
 	if err != nil || localProduct == nil {
@@ -759,6 +915,9 @@ func (s *Service) syncProductFromData(mapping *mappingdomain.Mapping, conn *site
 		upFulfillment = constants.FulfillmentTypeManual
 	}
 	mapping.UpstreamFulfillmentType = upFulfillment
+	if upProduct.FakaProcurement != nil {
+		mapping.FakaProcurementProfile = upProduct.FakaProcurement.MappingSnapshot()
+	}
 	mapping.UpstreamStatus = mappingdomain.UpstreamStatusActive
 	mapping.LastSyncedAt = now
 	_ = s.mappings.Update(mapping)

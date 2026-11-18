@@ -758,6 +758,7 @@ onMounted(() => { fetchConnections(); fetchCategories(); fetchMappings() })
             <SelectItem value="__all__">{{ t('productMappings.filter.allUpstreamStatus') }}</SelectItem>
             <SelectItem value="inactive">{{ t('productMappings.filter.upstreamInactive') }}</SelectItem>
             <SelectItem value="deleted">{{ t('productMappings.filter.upstreamDeleted') }}</SelectItem>
+            <SelectItem value="identity_error">{{ t('productMappings.filter.identityError') }}</SelectItem>
           </SelectContent>
         </Select>
         <Select v-model="filters.product_status" @update:modelValue="handleFilterChange">
@@ -844,6 +845,12 @@ onMounted(() => { fetchConnections(); fetchCategories(); fetchMappings() })
                 class="shrink-0 inline-flex rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-[10px] text-red-700"
               >
                 {{ t('productMappings.upstreamStatus.deleted') }}
+              </span>
+              <span
+                v-else-if="mapping.upstream_status === 'identity_error'"
+                class="shrink-0 inline-flex rounded-full border border-red-300 bg-red-100 px-2 py-0.5 text-[10px] font-medium text-red-800"
+              >
+                {{ t('productMappings.upstreamStatus.identityError') }}
               </span>
             </div>
             <div class="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">

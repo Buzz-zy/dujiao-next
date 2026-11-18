@@ -19,6 +19,9 @@ func (s *Service) HandleUpstreamCallback(procurementOrderID uint, upstreamStatus
 	if procOrder == nil {
 		return procurementcontract.ErrNotFound
 	}
+	if procOrder.Connection != nil && procOrder.Connection.Protocol == constants.ConnectionProtocolFaka {
+		return fmt.Errorf("Faka does not support authenticated delivery callbacks")
+	}
 
 	now := time.Now()
 	upstreamStatus = strings.ToLower(strings.TrimSpace(upstreamStatus))

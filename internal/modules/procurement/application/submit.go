@@ -2,8 +2,10 @@ package application
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
-	"maps"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/dujiao-next/internal/logger"
 	procurementcontract "github.com/dujiao-next/internal/modules/procurement/contract"
 	procurementdomain "github.com/dujiao-next/internal/modules/procurement/domain"
+	"github.com/shopspring/decimal"
 )
 
 // SubmitToUpstream Worker 调用：向上游站点提交采购单
@@ -23,6 +26,20 @@ func (s *Service) SubmitToUpstream(procurementOrderID uint) error {
 	if procOrder == nil {
 		return procurementcontract.ErrNotFound
 	}
+	rejectFakaBeforeTrade := func(cause error) error {
+		updated, updateErr := s.procRepo.UpdateStatus(procOrder.ID, constants.ProcurementStatusSubmitting, constants.ProcurementStatusRejected, map[string]interface{}{
+			"error_message": cause.Error(),
+			"updated_at":    time.Now(),
+		})
+		if updateErr != nil {
+			return fmt.Errorf("persist Faka pre-trade rejection (submission remains frozen): %w", updateErr)
+		}
+		if !updated {
+			return fmt.Errorf("persist Faka pre-trade rejection: %w", procurementcontract.ErrStatusInvalid)
+		}
+		logger.Warnw("faka_procurement_rejected_before_trade", "procurement_order_id", procOrder.ID, "trace_id", procOrder.TraceID, "error", cause)
+		return nil
+	}
 
 	// 校验状态
 	if procOrder.Status != "pending" && procOrder.Status != "failed" {
@@ -30,8 +47,35 @@ func (s *Service) SubmitToUpstream(procurementOrderID uint) error {
 	}
 
 	// 获取连接和适配器
+	localOrder, err := s.orderRepo.GetByID(procOrder.LocalOrderID)
+	if err != nil {
+		s.markProcurementError(procOrder, fmt.Sprintf("load local order failed: %v", err))
+		return fmt.Errorf("load local order: %w", err)
+	}
+	if localOrder == nil {
+		s.rejectProcurement(procOrder, fmt.Sprintf("local order %d not found", procOrder.LocalOrderID))
+		return nil
+	}
+	if len(localOrder.Items) != 1 {
+		s.rejectProcurement(procOrder, fmt.Sprintf("local order %d has %d items; procurement supports one item per child order", localOrder.ID, len(localOrder.Items)))
+		return nil
+	}
+	productMapping, err := s.mappingRepo.FindMappingForProduct(localOrder.Items[0].ProductID)
+	if err != nil {
+		s.markProcurementError(procOrder, fmt.Sprintf("read product mapping failed: %v", err))
+		return fmt.Errorf("read product mapping: %w", err)
+	}
+	skuMapping, err := s.skuMapRepo.FindMappingForSKU(localOrder.Items[0].SKUID)
+	if err != nil {
+		s.markProcurementError(procOrder, fmt.Sprintf("read SKU mapping failed: %v", err))
+		return fmt.Errorf("read SKU mapping: %w", err)
+	}
 	connection, err := s.connections.Open(procOrder.ConnectionID)
 	if err != nil {
+		if errors.Is(err, procurementcontract.ErrConnectionNotFound) {
+			s.rejectProcurement(procOrder, err.Error())
+			return nil
+		}
 		s.markProcurementError(procOrder, fmt.Sprintf("load connection failed: %v", err))
 		return fmt.Errorf("load connection: %w", err)
 	}
@@ -39,13 +83,17 @@ func (s *Service) SubmitToUpstream(procurementOrderID uint) error {
 		s.rejectProcurement(procOrder, fmt.Sprintf("connection %d not found", procOrder.ConnectionID))
 		return nil // 永久性错误，不重试
 	}
+	if err := procurementcontract.ValidateProcurementMapping(productMapping, skuMapping, localOrder.Items[0].ProductID, localOrder.Items[0].SKUID, procOrder.ConnectionID, connection.Protocol() == constants.ConnectionProtocolFaka); err != nil {
+		s.rejectProcurement(procOrder, err.Error())
+		return nil
+	}
+	fakaSubmission := connection.Protocol() == constants.ConnectionProtocolFaka
+	if connection == nil {
+		s.rejectProcurement(procOrder, fmt.Sprintf("connection %d not found", procOrder.ConnectionID))
+		return nil // 永久性错误，不重试
+	}
 
 	// 加载本地订单获取 SKU 信息
-	localOrder, err := s.orderRepo.GetByID(procOrder.LocalOrderID)
-	if err != nil {
-		s.markProcurementError(procOrder, fmt.Sprintf("load local order failed: %v", err))
-		return fmt.Errorf("load local order: %w", err)
-	}
 	if localOrder == nil {
 		s.rejectProcurement(procOrder, fmt.Sprintf("local order %d not found", procOrder.LocalOrderID))
 		return nil // 永久性错误，不重试
@@ -62,23 +110,28 @@ func (s *Service) SubmitToUpstream(procurementOrderID uint) error {
 	item := localOrder.Items[0]
 
 	// 查找 SKU 映射
-	upstreamSKUID, found, err := s.skuMapRepo.FindUpstreamSKUID(item.SKUID)
-	if err != nil {
-		s.markProcurementError(procOrder, fmt.Sprintf("lookup sku mapping failed: %v", err))
-		return fmt.Errorf("lookup sku mapping: %w", err)
-	}
-	if !found {
-		s.rejectProcurement(procOrder, fmt.Sprintf("no sku mapping for local sku %d", item.SKUID))
-		return nil // 永久性错误，不重试
+	var upstreamSKUID uint
+	if !fakaSubmission {
+		var found bool
+		upstreamSKUID, found, err = s.skuMapRepo.FindUpstreamSKUID(item.SKUID)
+		if err != nil {
+			s.markProcurementError(procOrder, fmt.Sprintf("lookup sku mapping failed: %v", err))
+			return fmt.Errorf("lookup sku mapping: %w", err)
+		}
+		if !found {
+			s.rejectProcurement(procOrder, fmt.Sprintf("no sku mapping for local sku %d", item.SKUID))
+			return nil // 永久性错误，不重试
+		}
 	}
 
 	// 构建上游请求
 	req := procurementcontract.CreateOrderRequest{
-		SKUID:             upstreamSKUID,
-		Quantity:          item.Quantity,
-		DownstreamOrderNo: localOrder.OrderNo,
-		TraceID:           procOrder.TraceID,
-		CallbackURL:       connection.CallbackURL(),
+		SKUID:               upstreamSKUID,
+		UpstreamProductCode: productMapping.UpstreamProductCode,
+		Quantity:            item.Quantity,
+		DownstreamOrderNo:   localOrder.OrderNo,
+		TraceID:             procOrder.TraceID,
+		CallbackURL:         connection.CallbackURL(),
 	}
 
 	// 传递人工表单数据（如有）
@@ -89,12 +142,107 @@ func (s *Service) SubmitToUpstream(procurementOrderID uint) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	var fakaIntentEventID string
+	if fakaSubmission {
+		claimed, claimErr := s.procRepo.UpdateStatus(procOrder.ID, procOrder.Status, constants.ProcurementStatusSubmitting, map[string]interface{}{
+			"updated_at": time.Now(),
+		})
+		if claimErr != nil {
+			return fmt.Errorf("claim faka procurement submission: %w", claimErr)
+		}
+		if !claimed {
+			return procurementcontract.ErrStatusInvalid
+		}
+		procOrder.Status = constants.ProcurementStatusSubmitting
+		if s.evidenceStore == nil {
+			return s.freezeFakaForEvidenceFailure(procOrder, errors.New("local Trade evidence store is unavailable"))
+		}
+		existingEvents, evidenceErr := s.evidenceStore.GetByTraceID(procOrder.TraceID)
+		if evidenceErr != nil {
+			return s.freezeFakaForEvidenceFailure(procOrder, fmt.Errorf("read existing Trade evidence: %w", evidenceErr))
+		}
+		for _, event := range existingEvents {
+			if event.ProcurementOrderID == procOrder.ID && event.EventType == "trade_intent" {
+				return s.freezeFakaForEvidenceFailure(procOrder, errors.New("prior Trade intent exists without a safe new submission authorization"))
+			}
+		}
+		intentID, idErr := newEvidenceEventID()
+		if idErr != nil {
+			return s.freezeFakaForEvidenceFailure(procOrder, idErr)
+		}
+		intent := procurementcontract.EvidenceEvent{EventID: intentID, ProcurementOrderID: procOrder.ID, TraceID: procOrder.TraceID, EventType: "trade_intent", SchemaVersion: 1, Supplier: "faka"}
+		if err := s.evidenceStore.AppendIntent(intent); err != nil {
+			return s.freezeFakaForEvidenceFailure(procOrder, fmt.Errorf("persist local Trade intent: %w", err))
+		}
+		fakaIntentEventID = intentID
+		if s.evidenceConfirmer == nil {
+			return s.freezeFakaForEvidenceFailure(procOrder, errors.New("independent S3 evidence confirmation is not configured; Trade is disabled"))
+		}
+		if err := s.evidenceConfirmer.ConfirmIndependent(intentID); err != nil {
+			return s.freezeFakaForEvidenceFailure(procOrder, fmt.Errorf("confirm independent Trade intent persistence: %w", err))
+		}
+
+		// Re-read persistent mapping identity after acquiring the unique submission right.
+		latestMapping, mappingErr := s.mappingRepo.FindMappingForProduct(item.ProductID)
+		if mappingErr != nil {
+			return rejectFakaBeforeTrade(fmt.Errorf("reload Faka product mapping: %w", mappingErr))
+		}
+		latestSKU, skuErr := s.skuMapRepo.FindMappingForSKU(item.SKUID)
+		if skuErr != nil {
+			return rejectFakaBeforeTrade(fmt.Errorf("reload Faka SKU mapping: %w", skuErr))
+		}
+		if err := procurementcontract.ValidateProcurementMapping(latestMapping, latestSKU, item.ProductID, item.SKUID, procOrder.ConnectionID, true); err != nil {
+			return rejectFakaBeforeTrade(err)
+		}
+		if latestMapping.ID != productMapping.ID || latestMapping.UpstreamProductID != productMapping.UpstreamProductID || latestMapping.UpstreamProductCode != productMapping.UpstreamProductCode {
+			return rejectFakaBeforeTrade(fmt.Errorf("Faka persisted product identity changed before live verification"))
+		}
+		verifier, ok := connection.(procurementcontract.FakaProcurementCapabilityVerifier)
+		if !ok {
+			return rejectFakaBeforeTrade(fmt.Errorf("Faka live procurement capability verifier is unavailable"))
+		}
+		if err := verifier.VerifyFakaProcurementCapability(ctx, latestMapping.UpstreamProductCode, latestMapping.UpstreamProductID, item.Quantity); err != nil {
+			return rejectFakaBeforeTrade(fmt.Errorf("Faka live procurement capability check failed: %w", err))
+		}
+	}
+
 	resp, err := connection.CreateOrder(ctx, req)
 	if err != nil {
+		if fakaSubmission {
+			if errors.Is(err, procurementcontract.ErrSubmissionNotSent) {
+				return rejectFakaBeforeTrade(err)
+			}
+			freezeUpdates := map[string]interface{}{
+				"error_message": fmt.Sprintf("faka submission result is unknown: %v", err),
+				"updated_at":    time.Now(),
+			}
+			if resp != nil && strings.TrimSpace(resp.OrderNo) != "" {
+				freezeUpdates["upstream_order_no"] = resp.OrderNo
+			}
+			frozen, freezeErr := s.procRepo.UpdateStatus(procOrder.ID, constants.ProcurementStatusSubmitting, constants.ProcurementStatusAwaitingVerification, freezeUpdates)
+			if freezeErr != nil {
+				return fmt.Errorf("freeze procurement for manual verification: %w", freezeErr)
+			}
+			if !frozen {
+				return fmt.Errorf("freeze procurement for manual verification: %w", procurementcontract.ErrStatusInvalid)
+			}
+			logger.Warnw("procurement_awaiting_verification", "procurement_order_id", procOrder.ID, "trace_id", procOrder.TraceID, "error", err)
+			return nil
+		}
 		return s.handleSubmitFailure(procOrder, connection, fmt.Sprintf("upstream request error: %v", err), true)
 	}
 
 	if !resp.OK {
+		if fakaSubmission {
+			errMsg := strings.TrimSpace(resp.ErrorMessage)
+			if errMsg == "" {
+				errMsg = strings.TrimSpace(resp.ErrorCode)
+			}
+			if errMsg == "" {
+				errMsg = "upstream rejected procurement"
+			}
+			return s.handleSubmitFailure(procOrder, connection, fmt.Sprintf("faka rejected procurement: %s", errMsg), false)
+		}
 		retryable := isRetryableErrorCode(resp.ErrorCode)
 		errMsg := resp.ErrorMessage
 		if errMsg == "" {
@@ -112,14 +260,105 @@ func (s *Service) SubmitToUpstream(procurementOrderID uint) error {
 		"upstream_currency": resp.Currency,
 		"updated_at":        now,
 	}
-	updates := maps.Clone(upstreamFields)
+	if fakaSubmission {
+		responseID, idErr := newEvidenceEventID()
+		if idErr != nil {
+			return s.freezeFakaForEvidenceFailure(procOrder, idErr)
+		}
+		responseEvent := procurementcontract.EvidenceEvent{EventID: responseID, ProcurementOrderID: procOrder.ID, TraceID: procOrder.TraceID, EventType: "trade_response", TradeNo: resp.OrderNo, Amount: resp.Amount, ResponseAt: now.UTC(), SchemaVersion: 1, Supplier: "faka", RelatedEventID: fakaIntentEventID}
+		if err := s.evidenceStore.AppendResponse(responseEvent); err != nil {
+			return s.freezeFakaForEvidenceFailure(procOrder, fmt.Errorf("persist local Trade response: %w", err))
+		}
+		if s.evidenceConfirmer == nil {
+			return s.freezeFakaForEvidenceFailure(procOrder, errors.New("independent S3 response confirmation is not configured; normal acceptance is disabled"))
+		}
+		if err := s.evidenceConfirmer.ConfirmIndependent(responseID); err != nil {
+			return s.freezeFakaForEvidenceFailure(procOrder, fmt.Errorf("confirm independent Trade response persistence: %w", err))
+		}
+		entry, journalErr := procurementcontract.TradeResponseJournalEntryFromEvidence(responseEvent)
+		if s.decisionAudit == nil {
+			journalErr = errors.New("journal is unavailable")
+		} else if journalErr == nil {
+			journalErr = s.decisionAudit.AppendTradeResponseJournal(entry)
+		}
+		if journalErr != nil {
+			logger.Errorw("faka_trade_response_journal_failed", "procurement_order_id", procOrder.ID, "trace_id", procOrder.TraceID, "error", journalErr)
+			frozen, freezeErr := s.procRepo.UpdateStatus(procOrder.ID, constants.ProcurementStatusSubmitting, constants.ProcurementStatusAwaitingVerification, map[string]interface{}{
+				"error_message": "Faka Trade succeeded but response journal persistence failed; verify upstream result before recovery",
+				"updated_at":    time.Now(),
+			})
+			if freezeErr != nil || !frozen {
+				logger.Errorw("faka_trade_journal_failure_freeze_failed", "procurement_order_id", procOrder.ID, "trace_id", procOrder.TraceID, "error", freezeErr, "updated", frozen)
+			}
+			s.notifyProcurementFailure(procOrder, fmt.Sprintf("CRITICAL: Faka Trade succeeded but response journal persistence failed for trace %s", procOrder.TraceID))
+			if freezeErr != nil {
+				return fmt.Errorf("persist Faka Trade response evidence: %w; freeze procurement for manual verification: %v", journalErr, freezeErr)
+			}
+			if !frozen {
+				return fmt.Errorf("persist Faka Trade response evidence: %w; procurement state changed before it could be frozen", journalErr)
+			}
+			return fmt.Errorf("persist Faka Trade response evidence: %w", journalErr)
+		}
+	}
+	updates := make(map[string]interface{}, len(upstreamFields)+2)
+	for key, value := range upstreamFields {
+		updates[key] = value
+	}
 	updates["error_message"] = ""
 	updates["retry_count"] = 0
-	accepted, err := s.procRepo.UpdateStatus(procOrder.ID, procOrder.Status, constants.ProcurementStatusAccepted, updates)
+	fromStatus := procOrder.Status
+	if fakaSubmission {
+		fromStatus = constants.ProcurementStatusSubmitting
+	}
+	accepted, err := s.procRepo.UpdateStatus(procOrder.ID, fromStatus, constants.ProcurementStatusAccepted, updates)
 	if err != nil {
+		if fakaSubmission {
+			logger.Errorw("faka_trade_succeeded_but_local_write_failed", "procurement_order_id", procOrder.ID, "trace_id", procOrder.TraceID, "trade_no", resp.OrderNo, "error", err)
+			// The trade already succeeded. Preserve its number and freeze even if the
+			// accepted-state write failed; if this also fails, submitting stays frozen.
+			frozen, freezeErr := s.procRepo.UpdateStatus(procOrder.ID, constants.ProcurementStatusSubmitting, constants.ProcurementStatusAwaitingVerification, map[string]interface{}{
+				"error_message": "Faka Trade succeeded but local acceptance write failed; verify upstream result before recovery",
+				"updated_at":    time.Now(),
+			})
+			if freezeErr != nil || !frozen {
+				logger.Errorw("faka_trade_freeze_failed", "procurement_order_id", procOrder.ID, "trace_id", procOrder.TraceID, "trade_no", resp.OrderNo, "error", freezeErr, "updated", frozen)
+			}
+			return s.reportFakaTradeCASRecovery(procOrder, resp, err, frozen, freezeErr)
+		}
 		return fmt.Errorf("update procurement status: %w", err)
 	}
 	if !accepted {
+		if fakaSubmission {
+			current, readErr := s.procRepo.GetByID(procOrder.ID)
+			if readErr != nil {
+				return fmt.Errorf("reload procurement after lost Faka submission CAS: %w", readErr)
+			}
+			if current == nil {
+				return procurementcontract.ErrNotFound
+			}
+			if current.Status == constants.ProcurementStatusAccepted {
+				conflictType := "late_response_same_trade_no"
+				if current.UpstreamOrderNo != resp.OrderNo {
+					conflictType = "late_response_trade_no_mismatch"
+				}
+				if s.decisionAudit == nil {
+					return fmt.Errorf("persist late Faka trade response: audit unavailable")
+				}
+				if auditErr := s.decisionAudit.AppendTradeResponseJournal(procurementdomain.TradeResponseJournalEntry{
+					ProcurementOrderID: procOrder.ID, TraceID: procOrder.TraceID, UpstreamTradeNo: resp.OrderNo,
+					Amount: resp.Amount, ConfirmedTradeNo: current.UpstreamOrderNo, ConfirmedAmount: current.UpstreamAmount.String(),
+					ResponseTime: time.Now(), EventType: conflictType,
+				}); auditErr != nil {
+					return fmt.Errorf("persist late Faka trade journal event: %w", auditErr)
+				}
+				if current.UpstreamOrderNo != resp.OrderNo {
+					return fmt.Errorf("Faka late Trade conflict: administrator confirmed trade %q, worker returned %q", current.UpstreamOrderNo, resp.OrderNo)
+				}
+				return fmt.Errorf("Faka Trade response arrived after manual confirmation; matching trade %q recorded", resp.OrderNo)
+			}
+			logger.Errorw("faka_late_trade_state_conflict", "procurement_order_id", procOrder.ID, "trace_id", procOrder.TraceID, "status", current.Status, "worker_trade_no", resp.OrderNo)
+			return fmt.Errorf("Faka late Trade returned after procurement state changed to %q", current.Status)
+		}
 		return s.recordUpstreamOrderAfterStatusChanged(procOrder.ID, resp.OrderNo, upstreamFields)
 	}
 
@@ -142,6 +381,95 @@ func (s *Service) SubmitToUpstream(procurementOrderID uint) error {
 	}
 
 	return nil
+}
+
+func newEvidenceEventID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", fmt.Errorf("generate evidence event ID: %w", err)
+	}
+	return hex.EncodeToString(id[:]), nil
+}
+
+func (s *Service) freezeFakaForEvidenceFailure(order *procurementdomain.Order, cause error) error {
+	if order == nil {
+		return fmt.Errorf("Faka Trade blocked by evidence failure: %w", cause)
+	}
+	frozen, freezeErr := s.procRepo.UpdateStatus(order.ID, constants.ProcurementStatusSubmitting, constants.ProcurementStatusAwaitingVerification, map[string]interface{}{"error_message": "Faka Trade blocked because durable independent evidence confirmation is unavailable; manual verification required", "updated_at": time.Now()})
+	if freezeErr != nil {
+		return fmt.Errorf("Faka Trade blocked by evidence failure: %w; freeze failed: %v; order remains submitting and must not retry", cause, freezeErr)
+	}
+	if !frozen {
+		return fmt.Errorf("Faka Trade blocked by evidence failure: %w; freeze CAS did not apply; order must not retry", cause)
+	}
+	return fmt.Errorf("Faka Trade blocked by evidence failure: %w; order frozen for manual verification", cause)
+}
+
+// reportFakaTradeCASRecovery only reads durable state after an ambiguous local
+// write. It never retries Trade, changes procurement state, or enqueues work.
+func (s *Service) reportFakaTradeCASRecovery(procOrder *procurementdomain.Order, response *procurementcontract.CreateOrderResult, casErr error, freezeSucceeded bool, freezeErr error) error {
+	if procOrder == nil || response == nil {
+		return fmt.Errorf("Faka Trade response recovery failed: missing procurement order or response; Trade CAS error: %w", casErr)
+	}
+	current, readErr := s.procRepo.GetByID(procOrder.ID)
+	if readErr != nil {
+		return fmt.Errorf("Faka Trade response recovery failed: reload procurement order %d: %v (freeze_succeeded=%t, freeze_error=%v); Trade CAS result is uncertain: %w", procOrder.ID, freezeSucceeded, freezeErr, readErr, casErr)
+	}
+	if current == nil {
+		return fmt.Errorf("Faka Trade response recovery failed: procurement order %d is missing after CAS error (freeze_succeeded=%t, freeze_error=%v); Trade CAS result is uncertain: %w", procOrder.ID, freezeSucceeded, freezeErr, casErr)
+	}
+	if current.TraceID != procOrder.TraceID {
+		return fmt.Errorf("Faka Trade response recovery failed: procurement order %d TraceID changed from %q to %q; state left untouched; Trade CAS result is uncertain: %w", procOrder.ID, procOrder.TraceID, current.TraceID, casErr)
+	}
+	if s.decisionAudit == nil {
+		return fmt.Errorf("Faka Trade response recovery failed: journal reader unavailable for procurement order %d trace %q (status=%q, freeze_succeeded=%t, freeze_error=%v); Trade CAS result is uncertain: %w", procOrder.ID, procOrder.TraceID, current.Status, freezeSucceeded, freezeErr, casErr)
+	}
+	events, journalErr := s.decisionAudit.ListTradeResponseJournalByTraceID(procOrder.TraceID)
+	if journalErr != nil {
+		return fmt.Errorf("Faka Trade response recovery failed: read journal for procurement order %d trace %q: %v (status=%q, freeze_succeeded=%t, freeze_error=%v); Trade CAS result is uncertain: %w", procOrder.ID, procOrder.TraceID, journalErr, current.Status, freezeSucceeded, freezeErr, casErr)
+	}
+	sameAmount := func(left, right string) bool {
+		leftAmount, leftErr := decimal.NewFromString(strings.TrimSpace(left))
+		rightAmount, rightErr := decimal.NewFromString(strings.TrimSpace(right))
+		return leftErr == nil && rightErr == nil && leftAmount.Equal(rightAmount)
+	}
+	sameStoredAmount := func(left, right string) bool {
+		leftAmount, leftErr := decimal.NewFromString(strings.TrimSpace(left))
+		rightAmount, rightErr := decimal.NewFromString(strings.TrimSpace(right))
+		return leftErr == nil && rightErr == nil && leftAmount.Round(2).Equal(rightAmount.Round(2))
+	}
+	matching := 0
+	for _, event := range events {
+		if event.TraceID != procOrder.TraceID {
+			continue
+		}
+		if event.ProcurementOrderID != procOrder.ID {
+			return fmt.Errorf("Faka Trade response recovery conflict: TraceID %q is also associated with procurement order %d, expected %d; current status=%q; state preserved; CAS result uncertain: %w", procOrder.TraceID, event.ProcurementOrderID, procOrder.ID, current.Status, casErr)
+		}
+		if event.EventType != "trade_success_response" {
+			continue
+		}
+		if event.UpstreamTradeNo != response.OrderNo || !sameAmount(event.Amount, response.Amount) {
+			return fmt.Errorf("Faka Trade response recovery conflict: journal evidence for procurement order %d trace %q has trade=%q amount=%q, response has trade=%q amount=%q; current status=%q; no state changed; CAS result uncertain: %w", procOrder.ID, procOrder.TraceID, event.UpstreamTradeNo, event.Amount, response.OrderNo, response.Amount, current.Status, casErr)
+		}
+		matching++
+	}
+	if matching != 1 {
+		return fmt.Errorf("Faka Trade response recovery failed: found %d matching durable success events for procurement order %d trace %q trade=%q amount=%q; current status=%q, freeze_succeeded=%t, freeze_error=%v; CAS result uncertain: %w", matching, procOrder.ID, procOrder.TraceID, response.OrderNo, response.Amount, current.Status, freezeSucceeded, freezeErr, casErr)
+	}
+	if current.UpstreamOrderNo != "" && current.UpstreamOrderNo != response.OrderNo {
+		return fmt.Errorf("Faka Trade response recovery conflict: procurement order %d trace %q currently has trade=%q amount=%s, journal has trade=%q amount=%q; status=%q; administrator/current data preserved; CAS result uncertain: %w", procOrder.ID, procOrder.TraceID, current.UpstreamOrderNo, current.UpstreamAmount.String(), response.OrderNo, response.Amount, current.Status, casErr)
+	}
+	if current.UpstreamOrderNo == "" && current.UpstreamAmount.String() != "0.00" && !sameStoredAmount(current.UpstreamAmount.String(), response.Amount) {
+		return fmt.Errorf("Faka Trade response recovery conflict: procurement order %d trace %q has no trade number but current amount=%s differs from journal amount=%q; status=%q; data preserved; CAS result uncertain: %w", procOrder.ID, procOrder.TraceID, current.UpstreamAmount.String(), response.Amount, current.Status, casErr)
+	}
+	if current.UpstreamOrderNo == response.OrderNo && !sameStoredAmount(current.UpstreamAmount.String(), response.Amount) {
+		return fmt.Errorf("Faka Trade response recovery conflict: procurement order %d trace %q has matching trade=%q but current amount=%s differs from journal amount=%q; status=%q; data preserved; CAS result uncertain: %w", procOrder.ID, procOrder.TraceID, response.OrderNo, current.UpstreamAmount.String(), response.Amount, current.Status, casErr)
+	}
+	if current.Status == constants.ProcurementStatusAccepted && current.UpstreamOrderNo == response.OrderNo && sameStoredAmount(current.UpstreamAmount.String(), response.Amount) {
+		return fmt.Errorf("Faka Trade response recovery verified: procurement order %d trace %q already contains matching accepted state trade=%q amount=%q; no change made; original database result was uncertain: %w", procOrder.ID, procOrder.TraceID, response.OrderNo, response.Amount, casErr)
+	}
+	return fmt.Errorf("Faka Trade response recovery evidence ready for administrator review: procurement order %d trace %q status=%q trade=%q amount=%q; freeze_succeeded=%t, freeze_error=%v; no state change or retry performed; original database result was uncertain: %w", procOrder.ID, procOrder.TraceID, current.Status, response.OrderNo, response.Amount, freezeSucceeded, freezeErr, casErr)
 }
 
 // markProcurementError 记录错误信息但不改变状态（用于瞬态错误，asynq 可重试）
@@ -212,6 +540,7 @@ func (s *Service) rollbackLocalOrderOnProcurementFailure(procOrder *procurementd
 			"updated_at": now,
 		})
 		// 如果是子订单，同步父订单状态
+
 		if localOrder.ParentID != nil && s.orderLifecycle != nil {
 			_, _ = s.orderLifecycle.SyncParentStatus(*localOrder.ParentID, now)
 		}
@@ -230,7 +559,9 @@ func (s *Service) notifyProcurementFailure(procOrder *procurementdomain.Order, e
 	if s.notifications == nil {
 		return
 	}
-	_ = s.notifications.NotifyFailure(procOrder, errMsg)
+	if err := s.notifications.NotifyFailure(procOrder, errMsg); err != nil {
+		logger.Errorw("procurement_failure_alert_enqueue_failed", "procurement_order_id", procOrder.ID, "error", err)
+	}
 }
 
 // handleSubmitFailure 处理提交失败

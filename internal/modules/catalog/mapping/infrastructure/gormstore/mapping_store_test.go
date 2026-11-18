@@ -2,6 +2,8 @@ package gormstore
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +52,99 @@ func setupMappingStoreTest(t *testing.T) (*MappingStore, *SKUMappingStore, *gorm
 		t.Fatalf("seed default category failed: %v", err)
 	}
 	return NewMappingStore(db), NewSKUMappingStore(db), db
+}
+
+type legacyProductMappingSchema struct {
+	ID                      uint   `gorm:"primarykey"`
+	ConnectionID            uint   `gorm:"index;not null"`
+	LocalProductID          uint   `gorm:"uniqueIndex;not null"`
+	UpstreamProductID       uint   `gorm:"not null"`
+	UpstreamFulfillmentType string `gorm:"type:varchar(20);not null;default:'manual'"`
+	UpstreamStatus          string `gorm:"type:varchar(16);not null;default:'active';index"`
+	IsActive                bool   `gorm:"not null;default:true"`
+	LastSyncedAt            *time.Time
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
+	DeletedAt               *time.Time `gorm:"index"`
+}
+
+func (legacyProductMappingSchema) TableName() string { return "product_mappings" }
+
+func TestMappingStorePersistsUpstreamProductCodeAcrossDatabaseReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mapping.db")
+	openDB := func() *gorm.DB {
+		db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+		if err != nil {
+			t.Fatalf("open temp sqlite: %v", err)
+		}
+		return db
+	}
+
+	firstDB := openDB()
+	if err := firstDB.AutoMigrate(&legacyProductMappingSchema{}); err != nil {
+		t.Fatalf("create legacy mapping schema: %v", err)
+	}
+	legacy := &legacyProductMappingSchema{ConnectionID: 1, LocalProductID: 101, UpstreamProductID: 7, IsActive: true}
+	if err := firstDB.Create(legacy).Error; err != nil {
+		t.Fatalf("create legacy mapping: %v", err)
+	}
+	if err := firstDB.AutoMigrate(&mappingdomain.Mapping{}); err != nil {
+		t.Fatalf("migrate legacy table with nullable code: %v", err)
+	}
+	var nullCodeRows int64
+	if err := firstDB.Model(&mappingdomain.Mapping{}).Where("id = ? AND upstream_product_code IS NULL", legacy.ID).Count(&nullCodeRows).Error; err != nil {
+		t.Fatalf("check legacy NULL code: %v", err)
+	}
+	if nullCodeRows != 1 {
+		t.Fatalf("legacy rows with NULL code = %d, want 1", nullCodeRows)
+	}
+	store := NewMappingStore(firstDB)
+	stableCode := strings.Repeat("faka-code-", 40)
+	withCode := &mappingdomain.Mapping{
+		ConnectionID: 1, LocalProductID: 102, UpstreamProductID: 8, UpstreamProductCode: stableCode, IsActive: true,
+		FakaProcurementProfile: jsonmap.JSON{
+			"raw_config": `{"sku":{}}`, "raw_widget": `null`,
+			"raw_draft_status": `0`, "raw_password_status": `0`,
+			"assessment_complete": true, "snapshot_valid": false,
+			"capability": map[string]interface{}{"status": "unsupported", "can_auto_procure": false},
+		},
+	}
+	if err := store.Create(withCode); err != nil {
+		t.Fatalf("create coded mapping: %v", err)
+	}
+	if sqlDB, err := firstDB.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
+
+	reopened := openDB()
+	defer func() {
+		if sqlDB, err := reopened.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	}()
+	var gotLegacy, gotCoded mappingdomain.Mapping
+	if err := reopened.First(&gotLegacy, legacy.ID).Error; err != nil {
+		t.Fatalf("read legacy row after reopen: %v", err)
+	}
+	if gotLegacy.UpstreamProductCode != "" {
+		t.Fatalf("legacy code = %q, want empty", gotLegacy.UpstreamProductCode)
+	}
+	if err := reopened.First(&gotCoded, withCode.ID).Error; err != nil {
+		t.Fatalf("read coded row after reopen: %v", err)
+	}
+	if gotCoded.UpstreamProductCode != stableCode {
+		t.Fatalf("reopened code length/value mismatch: got length %d, want %d", len(gotCoded.UpstreamProductCode), len(stableCode))
+	}
+	capability, ok := gotCoded.FakaProcurementProfile["capability"].(map[string]interface{})
+	if !ok || capability["status"] != "unsupported" || capability["can_auto_procure"] != false {
+		t.Fatalf("reopened Faka capability = %#v", gotCoded.FakaProcurementProfile)
+	}
+	if gotCoded.FakaProcurementProfile["raw_config"] != `{"sku":{}}` || gotCoded.FakaProcurementProfile["raw_widget"] != `null` {
+		t.Fatalf("reopened Faka raw configuration = %#v", gotCoded.FakaProcurementProfile)
+	}
+	if gotCoded.FakaProcurementProfile["raw_draft_status"] != `0` || gotCoded.FakaProcurementProfile["raw_password_status"] != `0` || gotCoded.FakaProcurementProfile["assessment_complete"] != true || gotCoded.FakaProcurementProfile["snapshot_valid"] != false {
+		t.Fatalf("reopened Faka metadata = %#v", gotCoded.FakaProcurementProfile)
+	}
 }
 
 func createMappedProduct(t *testing.T, db *gorm.DB, slug, title string) *productdomain.Product {
